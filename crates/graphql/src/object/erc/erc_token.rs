@@ -506,7 +506,9 @@ impl ResolvableObject for TokenObject {
                         .then(move |token| {
                             let pool = pool.clone();
                             async move {
-                                // Fetch complete token data including contract type
+                                // The update carries the token row but not its contract type,
+                                // which decides how the token is represented, so the row is read
+                                // back with its contract (primary key lookup).
                                 let query = "SELECT t.*, c.contract_type
                                                FROM tokens t
                                                JOIN contracts c ON t.contract_address = \

@@ -12,7 +12,7 @@ mod tests {
     use starknet::providers::JsonRpcClient;
     use tokio::sync::broadcast;
     use tokio_stream::StreamExt;
-    use torii_broker::types::{TokenBalanceUpdate, Update};
+    use torii_broker::types::{TokenBalanceUpdate, TokenUpdate, Update};
     use torii_broker::MemoryBroker;
     use torii_messaging::{Messaging, MessagingConfig};
     use torii_sqlite::executor::Executor;
@@ -552,6 +552,34 @@ mod tests {
         assert!(response.errors[0]
             .message
             .contains("Invalid accountAddress"));
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[serial]
+    async fn test_token_subscription_skips_contract_level_nft_rows(pool: SqlitePool) {
+        let schema = schema(&pool).await;
+        insert_tokens(&pool).await;
+
+        let token = |token_id: Option<u64>| -> TokenUpdate {
+            let token = torii_storage::proto::Token {
+                token_id: token_id.map(Into::into),
+                contract_address: ERC721,
+                ..Default::default()
+            };
+            Update::new(token, false)
+        };
+        let subscription = format!("subscription {{ tokenUpdated {{ {TOKEN_FIELDS} }} }}");
+        let data = first_subscription_item(&schema, &subscription, move || {
+            // Registering a collection publishes its contract-level row first.
+            MemoryBroker::publish(token(None));
+            MemoryBroker::publish(token(Some(1)));
+        })
+        .await;
+
+        let token = &data["tokenUpdated"]["tokenMetadata"];
+        assert_eq!(token["__typename"], "ERC721__Token");
+        assert_eq!(token["tokenId"], u256_to_sql_string(&U256::from(1u8)));
+        assert_eq!(token["metadataName"], "a \"quoted\" name");
     }
 
     // Balance ids (`account/contract:token_id`) contain '/', which `cursor::decode` can't handle
