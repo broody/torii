@@ -7,6 +7,7 @@ use std::sync::Arc;
 use torii_messaging::{Messaging, MessagingTrait};
 use torii_sqlite::types::Model;
 use torii_storage::ReadOnlyStorage;
+use tracing::warn;
 
 use super::object::connection::page_info::PageInfoObject;
 use super::object::entity::EntityObject;
@@ -179,9 +180,21 @@ async fn build_objects(pool: &SqlitePool) -> Result<(Vec<ObjectVariant>, Vec<Uni
     unions.push(erc_token_union);
 
     // model data objects
+    let mut has_model_types = false;
     for model in &models {
-        let schema: Ty = serde_json::from_str(&model.schema)
-            .map_err(|e| anyhow::anyhow!(format!("Failed to parse model schema: {e}")))?;
+        // A single model with a malformed schema must not take down the whole GraphQL schema.
+        let schema: Ty = match serde_json::from_str(&model.schema) {
+            Ok(schema) => schema,
+            Err(e) => {
+                warn!(
+                    namespace = %model.namespace,
+                    name = %model.name,
+                    error = %e,
+                    "Failed to parse model schema, skipping model in GraphQL schema."
+                );
+                continue;
+            }
+        };
         let type_mapping = build_type_mapping(&model.namespace, &schema);
 
         if !type_mapping.is_empty() {
@@ -191,6 +204,7 @@ async fn build_objects(pool: &SqlitePool) -> Result<(Vec<ObjectVariant>, Vec<Uni
             let type_name = utils::type_name_from_names(&model.namespace, &model.name);
 
             model_union = model_union.possible_type(&type_name);
+            has_model_types = true;
 
             objects.push(ObjectVariant::Resolvable(Box::new(ModelDataObject::new(
                 field_name,
@@ -203,7 +217,7 @@ async fn build_objects(pool: &SqlitePool) -> Result<(Vec<ObjectVariant>, Vec<Uni
 
     // When creating an empty union, add the empty type (this is required otherwise the schema will
     // be invalid)
-    if models.is_empty() {
+    if !has_model_types {
         model_union = model_union.possible_type(EMPTY_TYPE_NAME);
     }
 

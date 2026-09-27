@@ -38,6 +38,7 @@ use torii_sqlite::Sql;
 use torii_storage::proto::{ContractDefinition, ContractType};
 use torii_storage::Storage;
 
+mod dynamic_schema_test;
 mod entities_test;
 mod events_test;
 mod metadata_test;
