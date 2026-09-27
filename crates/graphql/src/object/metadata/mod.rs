@@ -3,7 +3,9 @@ use async_graphql::dynamic::{Field, FieldFuture, TypeRef};
 use async_graphql::{Name, Value};
 use convert_case::{Case, Casing};
 use sqlx::sqlite::SqliteRow;
-use sqlx::{Pool, Row, Sqlite};
+use sqlx::{Pool, Row, Sqlite, SqliteConnection};
+use torii_sqlite::constants::WORLD_CONTRACT_TYPE;
+use tracing::debug;
 
 use super::connection::page_info::PageInfoObject;
 use super::connection::{connection_arguments, cursor, parse_connection_arguments};
@@ -69,7 +71,11 @@ impl ResolvableObject for MetadataObject {
                         total_count,
                     )
                     .await?;
-                    let world_address = fetch_world_address(&mut conn).await?;
+                    let world_address = if data.is_empty() {
+                        String::new()
+                    } else {
+                        world_address(&mut conn).await?
+                    };
 
                     // convert json field to value_mapping expected by content object
                     let results = metadata_connection_output(
@@ -88,6 +94,28 @@ impl ResolvableObject for MetadataObject {
         field = connection_arguments(field);
 
         vec![field]
+    }
+}
+
+/// Address of the world the metadata belongs to.
+///
+/// The `metadata` table isn't scoped by world (rows are keyed by resource selector only), so rows
+/// can only be attributed when a single world is indexed. With no world or several worlds, the
+/// address is left empty rather than failing or picking an arbitrary world.
+async fn world_address(conn: &mut SqliteConnection) -> sqlx::Result<String> {
+    let worlds: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM contracts WHERE contract_type = ?")
+        .bind(WORLD_CONTRACT_TYPE)
+        .fetch_one(&mut *conn)
+        .await?;
+
+    if worlds == 1 {
+        fetch_world_address(conn).await
+    } else {
+        debug!(
+            worlds,
+            "Metadata world address is ambiguous, leaving it empty."
+        );
+        Ok(String::new())
     }
 }
 
@@ -156,7 +184,9 @@ fn extract_socials_mapping(name: &str, serde_value: &serde_json::Value) -> (Name
                     (Name::new("name"), Value::String(social_name.to_string())),
                     (
                         Name::new("url"),
-                        Value::String(social_url.as_str().unwrap().to_string()),
+                        social_url
+                            .as_str()
+                            .map_or(Value::Null, |url| Value::String(url.to_string())),
                     ),
                 ]))
             })

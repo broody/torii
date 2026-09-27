@@ -43,6 +43,7 @@ mod entities_test;
 mod erc_test;
 mod events_test;
 mod metadata_test;
+mod metadata_world_test;
 mod models_ordering_test;
 mod models_test;
 mod publish_message_test;
