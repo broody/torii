@@ -12,6 +12,7 @@ use async_graphql::{BatchRequest, Executor, ParseRequestError};
 use futures_util::{future, StreamExt};
 use http::header::{ALLOW, CONTENT_TYPE, SEC_WEBSOCKET_PROTOCOL};
 use http::{HeaderValue, Method, StatusCode};
+use http_body::{LengthLimitError, Limited};
 use hyper::{Body, Request, Response};
 use hyper_tungstenite::HyperWebsocket;
 use tokio::runtime::Handle;
@@ -30,6 +31,10 @@ pub(crate) const LOG_TARGET: &str = "torii::server::handlers::graphql";
 
 // Timeout for regular GraphQL requests (not WebSocket which are long-lived)
 const GRAPHQL_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Maximum size of a GraphQL request body. Queries are small; this bounds the memory a single
+/// request can make the server buffer.
+const MAX_REQUEST_BODY_SIZE: usize = 2 * 1024 * 1024;
 
 static PLAYGROUND: LazyLock<String> = LazyLock::new(playground_html);
 
@@ -197,9 +202,15 @@ async fn parse_request(req: Request<Body>) -> Result<BatchRequest, ParseRequestE
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(ToOwned::to_owned);
-    let body = hyper::body::to_bytes(req.into_body())
+    let body = hyper::body::to_bytes(Limited::new(req.into_body(), MAX_REQUEST_BODY_SIZE))
         .await
-        .map_err(|e| ParseRequestError::Io(std::io::Error::other(e)))?;
+        .map_err(|e| {
+            if e.is::<LengthLimitError>() {
+                ParseRequestError::PayloadTooLarge
+            } else {
+                ParseRequestError::Io(std::io::Error::other(e))
+            }
+        })?;
 
     receive_batch_body(content_type, body.as_ref(), MultipartOptions::default()).await
 }
@@ -438,6 +449,13 @@ mod tests {
             .handle(post(r#"{"query":"{ version }"}"#), CLIENT_ADDR)
             .await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let oversized = format!(
+            r#"{{"query":"{{ version }}","variables":{{"padding":"{}"}}}}"#,
+            "x".repeat(MAX_REQUEST_BODY_SIZE)
+        );
+        let response = handler.handle(post(&oversized), CLIENT_ADDR).await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[tokio::test]
