@@ -3,7 +3,6 @@ use async_graphql::dynamic::indexmap::IndexMap;
 use async_graphql::dynamic::{Field, InputValue, ResolverContext, TypeRef};
 use async_graphql::{Error, Name, Value};
 use sqlx::sqlite::SqliteRow;
-use sqlx::Row;
 
 use self::page_info::PageInfoObject;
 use super::BasicObject;
@@ -174,9 +173,7 @@ pub fn connection_output(
                 }
                 None => id_column.to_string(),
             };
-            let primary_order = row.try_get::<String, &str>(id_column)?;
-            let secondary_order = row.try_get_unchecked::<String, &str>(&order_field)?;
-            let cursor = cursor::encode(&primary_order, &secondary_order);
+            let cursor = cursor::encode_row(row, id_column, &order_field)?;
             let value_mapping = value_mapping_from_row(row, types, is_internal, snake_case)?;
 
             let mut edge = ValueMapping::new();

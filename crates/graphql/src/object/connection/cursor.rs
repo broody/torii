@@ -1,6 +1,8 @@
 use async_graphql::Error;
 use base64::engine::general_purpose;
 use base64::Engine as _;
+use sqlx::sqlite::SqliteRow;
+use sqlx::{Column, Row};
 
 /// Prefix of the legacy `cursor/{primary}/{secondary}` format, which is ambiguous when a value
 /// contains '/'. Still accepted by [`decode`] so cursors issued by older versions keep working.
@@ -12,6 +14,31 @@ pub fn encode(primary: &str, secondary: &str) -> String {
     let cursor = serde_json::to_string(&[primary, secondary])
         .expect("serializing a pair of strings cannot fail");
     general_purpose::STANDARD.encode(cursor.as_bytes())
+}
+
+/// Encodes the cursor of `row` from its `id_column` and the `order_column` the listing is ordered
+/// by. Column names are matched case-insensitively, as SQLite does, so an order field lowercased
+/// from a GraphQL enum item still finds a camelCase column.
+pub fn encode_row(row: &SqliteRow, id_column: &str, order_column: &str) -> sqlx::Result<String> {
+    let primary = column_text(row, id_column)?;
+    let secondary = column_text(row, order_column)?;
+    Ok(encode(&primary, &secondary))
+}
+
+fn column_text(row: &SqliteRow, column: &str) -> sqlx::Result<String> {
+    let columns = row.columns();
+    let index = columns
+        .iter()
+        .position(|c| c.name() == column)
+        .or_else(|| {
+            columns
+                .iter()
+                .position(|c| c.name().eq_ignore_ascii_case(column))
+        })
+        .ok_or_else(|| sqlx::Error::ColumnNotFound(column.to_string()))?;
+
+    // INTEGER values are read back as their decimal text representation.
+    row.try_get_unchecked::<String, _>(index)
 }
 
 pub fn decode(cursor: &str) -> Result<(String, String), Error> {
