@@ -198,9 +198,12 @@ pub fn value_mapping_from_row(
 
                     // handles felt arrays stored as string (ex: keys)
                     if let (TypeRef::List(_), Value::String(s)) = (type_ref, &value) {
-                        let mut felts: Vec<_> =
-                            s.split(SQL_FELT_DELIMITER).map(Value::from).collect();
-                        felts.pop(); // removes empty item
+                        // felts are stored with a trailing delimiter, e.g. `0x1/0x2/`
+                        let felts = s
+                            .split(SQL_FELT_DELIMITER)
+                            .filter(|felt| !felt.is_empty())
+                            .map(Value::from)
+                            .collect();
                         value = Value::List(felts);
                     }
 
@@ -355,8 +358,7 @@ fn fetch_value(
             let value = match type_name {
                 "DateTime" => {
                     let dt = row
-                        .try_get::<DateTime<Utc>, &str>(&column_name)
-                        .expect("Should be a stored as UTC Datetime")
+                        .try_get::<DateTime<Utc>, &str>(&column_name)?
                         .to_rfc3339();
                     Value::from(dt)
                 }
@@ -370,6 +372,41 @@ fn fetch_value(
                 }
             };
             Ok(value)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn felt_lists_drop_the_trailing_delimiter() {
+        let pool = SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let types = TypeMapping::from([(
+            Name::new("keys"),
+            TypeData::Simple(TypeRef::named_list(TypeRef::STRING)),
+        )]);
+
+        for (stored, expected) in [
+            ("0x1/0x2/", vec!["0x1", "0x2"]),
+            // an empty list is stored as a lone delimiter
+            ("/", vec![]),
+            ("", vec![]),
+        ] {
+            let row = sqlx::query("SELECT ? AS keys")
+                .bind(stored)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            let mapping = value_mapping_from_row(&row, &types, false, true).unwrap();
+            let expected = Value::List(expected.into_iter().map(Value::from).collect());
+            assert_eq!(mapping["keys"], expected, "stored {stored:?}");
         }
     }
 }
