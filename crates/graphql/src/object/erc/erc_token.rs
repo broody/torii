@@ -1,3 +1,5 @@
+use std::str::FromStr;
+
 use async_graphql::connection::PageInfo;
 use async_graphql::dynamic::{
     Field, FieldFuture, FieldValue, InputValue, SubscriptionField, SubscriptionFieldFuture, TypeRef,
@@ -5,6 +7,7 @@ use async_graphql::dynamic::{
 use async_graphql::{Name, Value};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Pool, Row, Sqlite, SqliteConnection};
+use starknet_crypto::Felt;
 use tokio_stream::StreamExt;
 use torii_broker::types::TokenUpdate;
 use torii_broker::MemoryBroker;
@@ -246,7 +249,8 @@ async fn fetch_tokens(
     let mut conditions = vec![];
     let mut binds = vec![];
     if let Some(addr) = contract_address {
-        conditions.push(format!("t.contract_address = '{}'", addr));
+        conditions.push("t.contract_address = ?".to_string());
+        binds.push(addr);
     }
 
     let mut cursor_param = &connection.after;
@@ -379,22 +383,36 @@ impl ResolvableObject for TokenObject {
                         FieldFuture::new(async move {
                             let mut conn = ctx.data::<Pool<Sqlite>>()?.acquire().await?;
                             let connection = parse_connection_arguments(&ctx)?;
-                            let contract_address = ctx
-                                .args
-                                .get("contractAddress")
-                                .map(|v| v.string().unwrap().to_string());
+                            // Normalized to the stored (padded) format so that equivalent
+                            // spellings of an address match.
+                            let contract_address = match ctx.args.get("contractAddress") {
+                                Some(value) if !value.is_null() => {
+                                    let address = value.string()?;
+                                    let address = Felt::from_str(address).map_err(|_| {
+                                        async_graphql::Error::new(format!(
+                                            "Invalid contractAddress: {address}"
+                                        ))
+                                    })?;
+                                    Some(felt_to_sql_string(&address))
+                                }
+                                _ => None,
+                            };
 
-                            let mut count_query =
-                                "SELECT COUNT(*) as count FROM tokens t".to_string();
-                            if let Some(addr) = &contract_address {
-                                count_query
-                                    .push_str(&format!(" WHERE t.contract_address = '{}'", addr));
-                            }
-
-                            let total_count: i64 = sqlx::query(&count_query)
-                                .fetch_one(&mut *conn)
-                                .await?
-                                .get("count");
+                            let total_count: i64 =
+                                match &contract_address {
+                                    Some(addr) => sqlx::query_scalar(
+                                        "SELECT COUNT(*) FROM tokens t WHERE t.contract_address \
+                                         = ?",
+                                    )
+                                    .bind(addr)
+                                    .fetch_one(&mut *conn)
+                                    .await?,
+                                    None => {
+                                        sqlx::query_scalar("SELECT COUNT(*) FROM tokens t")
+                                            .fetch_one(&mut *conn)
+                                            .await?
+                                    }
+                                };
 
                             let (data, page_info) =
                                 fetch_tokens(&mut conn, contract_address, &connection, total_count)

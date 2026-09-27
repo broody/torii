@@ -286,6 +286,37 @@ mod tests {
         assert_eq!(pages, [&expected[0..2], &expected[2..4], &expected[4..]]);
     }
 
+    #[sqlx::test(migrations = "../migrations")]
+    async fn test_tokens_contract_address_filter(pool: SqlitePool) {
+        let schema = schema(&pool).await;
+        let (erc20_a, erc20_b) = (Felt::from(0x40), Felt::from(0x41));
+        for contract in [erc20_a, erc20_b] {
+            insert_contract(&pool, contract, "ERC20").await;
+            insert_token(&pool, contract, None, None).await;
+        }
+
+        // Unpadded and padded spellings both match the stored (padded) address.
+        for address in [format!("{erc20_a:#x}"), felt_to_sql_string(&erc20_a)] {
+            let connection = tokens(&schema, &format!("(contractAddress: \"{address}\")")).await;
+            assert_eq!(connection["totalCount"], 1);
+            assert_eq!(keys(&connection, token_of), [felt_to_sql_string(&erc20_a)]);
+        }
+
+        // A null filter (e.g. an unset variable) doesn't filter instead of panicking.
+        let res = schema
+            .execute("query Tokens($address: String) { tokens(contractAddress: $address) { totalCount } }")
+            .await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        assert_eq!(res.data.into_json().unwrap()["tokens"]["totalCount"], 2);
+
+        // The address is validated and bound, never interpolated into the SQL.
+        let res = schema
+            .execute(r#"{ tokens(contractAddress: "0x40' OR '1'='1") { totalCount } }"#)
+            .await;
+        assert_eq!(res.errors.len(), 1);
+        assert!(res.errors[0].message.contains("Invalid contractAddress"));
+    }
+
     // Balance ids (`account/contract:token_id`) contain '/', which `cursor::decode` can't handle
     // yet; un-ignore once the connection cursor encoding supports it.
     #[ignore = "requires cursor::decode support for ids containing '/'"]
