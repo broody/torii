@@ -240,10 +240,11 @@ pub(crate) fn graphql_filter(
             GraphiQLSource::build()
                 .version("6.0.0-canary-d779fd3f.0")
                 .plugins(&[GraphiQLPlugin::explorer("6.0.0-canary-d779fd3f.0")])
-                .subscription_endpoint("/ws")
+                // Queries and subscriptions (over ws/wss) go to the URL the page is served from,
+                // so that it keeps working behind hosted services like Slot, which serve Torii
+                // under a path prefix.
+                .subscription_endpoint("")
                 .title("Torii GraphQL Playground")
-                // we patch the generated source to use the current URL instead of the origin
-                // for hosted services like SLOT
                 .finish(),
         )
     });

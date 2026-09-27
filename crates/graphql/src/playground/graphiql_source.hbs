@@ -108,8 +108,11 @@
         return fetch(url, {...opts, credentials: '{{ credentials }}'})
       }
 
+      // Endpoints are relative to the page (without its query, fragment and trailing slashes), so
+      // that the playground keeps working when served under a path prefix.
       createUrl = (endpoint, subscription = false) => {
-        const url = new URL(window.location.href.trimEnd('/') + endpoint);
+        const path = window.location.pathname.replace(/\/+$/, '');
+        const url = new URL(window.location.origin + path + endpoint);
         if (subscription) {
           url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
         }
@@ -135,7 +138,7 @@
           fetcher: GraphiQL.createFetcher({
             url: createUrl('{{ endpoint }}'),
             fetch: customFetch,
-            {{#if subscription_endpoint}}
+            {{#if (ne subscription_endpoint null)}}
             subscriptionUrl: createUrl('{{ subscription_endpoint }}', true),
             {{/if}}
             {{#if headers}}

@@ -239,8 +239,11 @@ mod tests {
         return fetch(url, {...opts, credentials: 'same-origin'})
       }
 
+      // Endpoints are relative to the page (without its query, fragment and trailing slashes), so
+      // that the playground keeps working when served under a path prefix.
       createUrl = (endpoint, subscription = false) => {
-        const url = new URL(window.location.href.trimEnd('/') + endpoint);
+        const path = window.location.pathname.replace(/\/+$/, '');
+        const url = new URL(window.location.origin + path + endpoint);
         if (subscription) {
           url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
         }
@@ -359,8 +362,11 @@ mod tests {
         return fetch(url, {...opts, credentials: 'same-origin'})
       }
 
+      // Endpoints are relative to the page (without its query, fragment and trailing slashes), so
+      // that the playground keeps working when served under a path prefix.
       createUrl = (endpoint, subscription = false) => {
-        const url = new URL(window.location.href.trimEnd('/') + endpoint);
+        const path = window.location.pathname.replace(/\/+$/, '');
+        const url = new URL(window.location.origin + path + endpoint);
         if (subscription) {
           url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
         }
@@ -381,6 +387,14 @@ mod tests {
   </body>
 </html>"#
         )
+    }
+
+    #[test]
+    fn test_with_page_relative_urls() {
+        let graphiql_source = GraphiQLSource::build().subscription_endpoint("").finish();
+
+        assert!(graphiql_source.contains("url: createUrl(''),"));
+        assert!(graphiql_source.contains("subscriptionUrl: createUrl('', true),"));
     }
 
     #[test]
@@ -488,8 +502,11 @@ mod tests {
         return fetch(url, {...opts, credentials: 'include'})
       }
 
+      // Endpoints are relative to the page (without its query, fragment and trailing slashes), so
+      // that the playground keeps working when served under a path prefix.
       createUrl = (endpoint, subscription = false) => {
-        const url = new URL(window.location.href.trimEnd('/') + endpoint);
+        const path = window.location.pathname.replace(/\/+$/, '');
+        const url = new URL(window.location.origin + path + endpoint);
         if (subscription) {
           url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
         }
