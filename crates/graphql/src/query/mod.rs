@@ -155,11 +155,14 @@ pub fn value_mapping_from_row(
     is_internal: bool,
     snake_case: bool,
 ) -> sqlx::Result<ValueMapping> {
-    // Retrieve entity ID if present
-    let entity_id = if let Ok(entity_id) = row.try_get::<String, &str>(ENTITY_ID_COLUMN) {
-        Some(entity_id)
-    } else {
-        row.try_get::<String, &str>(EVENT_MESSAGE_ID_COLUMN).ok()
+    // Retrieve entity ID if present. Model rows reference either an entity or an event message,
+    // the other column being NULL (which would decode as an empty `String`).
+    let entity_id = match row.try_get::<Option<String>, &str>(ENTITY_ID_COLUMN) {
+        Ok(Some(entity_id)) => Some(entity_id),
+        _ => row
+            .try_get::<Option<String>, &str>(EVENT_MESSAGE_ID_COLUMN)
+            .ok()
+            .flatten(),
     };
 
     fn build_value_mapping(

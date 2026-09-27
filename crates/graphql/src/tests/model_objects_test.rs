@@ -18,6 +18,7 @@ mod tests {
     use tokio::sync::broadcast;
     use torii_messaging::Messaging;
     use torii_sqlite::executor::Executor;
+    use torii_sqlite::utils::felt_to_sql_string;
     use torii_sqlite::Sql;
     use torii_storage::proto::{ContractDefinition, ContractType};
     use torii_storage::utils::format_world_scoped_id;
@@ -439,6 +440,41 @@ mod tests {
         assert_eq!(
             possible_types(schema(&db).await).await,
             json!([{ "name": "ns_Player_Stats" }])
+        );
+    }
+
+    // Model rows of event messages reference them through `internal_event_message_id`, their
+    // `internal_entity_id` being NULL.
+    #[sqlx::test(migrations = "../migrations")]
+    #[serial]
+    async fn test_event_message_model_nodes(pool: SqlitePool) {
+        let (db, _shutdown_tx) = setup_db(&pool).await;
+        register_model(&db, &player_stats(Felt::ZERO, None)).await;
+        let event_message_id =
+            set_event_message(&db, &player_stats(Felt::ONE, Some(7)), "0x1:0x0:0x0").await;
+        db.execute().await.unwrap();
+
+        let result = run_graphql_query(
+            &schema(&db).await,
+            "{ nsPlayerStatsModels { edges { node { score eventMessage { id keys } } } } }",
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            json!({
+                "nsPlayerStatsModels": {
+                    "edges": [{
+                        "node": {
+                            "score": 7,
+                            "eventMessage": {
+                                "id": event_message_id,
+                                "keys": [felt_to_sql_string(&Felt::ONE)],
+                            },
+                        }
+                    }]
+                }
+            })
         );
     }
 }
