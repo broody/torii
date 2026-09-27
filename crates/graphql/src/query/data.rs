@@ -365,23 +365,49 @@ fn cursor_condition(
     listing_direction: Direction,
     id_column: &str,
 ) -> Result<SqlCondition> {
-    let (id_value, order_value) =
-        cursor::decode(cursor).map_err(|_| sqlx::Error::Decode("Invalid cursor format".into()))?;
+    let (id_value, order_value) = cursor::decode_nullable(cursor)
+        .map_err(|_| sqlx::Error::Decode("Invalid cursor format".into()))?;
     let id_column = quote_identifier(id_column)?;
     let op = direction.comparator(listing_direction);
 
     match order {
         Some(order) => {
             let order_column = quote_identifier(&order.field)?;
-            Ok(SqlCondition {
-                sql: format!(
-                    "({order_column} {op} ? OR ({order_column} = ? AND {id_column} {op} ?))"
-                ),
-                binds: vec![
-                    SqlValue::Text(order_value.clone()),
-                    SqlValue::Text(order_value),
-                    SqlValue::Text(id_value),
-                ],
+            // SQLite sorts NULLs before any other value, and order columns can hold NULLs (e.g.
+            // members added by a model upgrade). Each condition below evaluates to true or false,
+            // never NULL, so that it can also be negated to look for rows on the other side.
+            let after_in_sort_order = op == ">";
+            Ok(match (order_value, after_in_sort_order) {
+                (Some(value), true) => SqlCondition {
+                    sql: format!(
+                        "({order_column} IS NOT NULL AND ({order_column} > ? OR ({order_column} \
+                         = ? AND {id_column} > ?)))"
+                    ),
+                    binds: vec![
+                        SqlValue::Text(value.clone()),
+                        SqlValue::Text(value),
+                        SqlValue::Text(id_value),
+                    ],
+                },
+                (Some(value), false) => SqlCondition {
+                    sql: format!(
+                        "({order_column} IS NULL OR {order_column} < ? OR ({order_column} = ? \
+                         AND {id_column} < ?))"
+                    ),
+                    binds: vec![
+                        SqlValue::Text(value.clone()),
+                        SqlValue::Text(value),
+                        SqlValue::Text(id_value),
+                    ],
+                },
+                (None, true) => SqlCondition {
+                    sql: format!("({order_column} IS NOT NULL OR {id_column} > ?)"),
+                    binds: vec![SqlValue::Text(id_value)],
+                },
+                (None, false) => SqlCondition {
+                    sql: format!("({order_column} IS NULL AND {id_column} < ?)"),
+                    binds: vec![SqlValue::Text(id_value)],
+                },
             })
         }
         None => Ok(SqlCondition {

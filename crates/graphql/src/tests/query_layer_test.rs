@@ -313,6 +313,74 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../migrations")]
+    async fn null_order_columns_paginate(pool: SqlitePool) {
+        let schema = setup(&pool).await;
+
+        // Members added by a model upgrade are NULL for rows written before it.
+        let null_items = [100u32, 101, 102];
+        for i in null_items {
+            sqlx::query(
+                "INSERT INTO [qtest-Item] (internal_id, internal_event_id, internal_executed_at, \
+                 item_id) VALUES (?, ?, CURRENT_TIMESTAMP, ?)",
+            )
+            .bind(format!("0x{i:x}"))
+            .bind(format!("0x{i:04x}:0x0:0x0"))
+            .bind(i)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // NULL columns are read as the zero value of their type, like a member added by an upgrade
+        // reads on-chain for existing entities.
+        let connection = items_query(&schema, "(where: {item_idGTE: 100})").await;
+        assert_eq!(connection["totalCount"], null_items.len());
+        for edge in connection["edges"].as_array().unwrap() {
+            assert_eq!(edge["node"]["amount"], 0);
+            assert_eq!(edge["node"]["nested"]["inner"], 0);
+        }
+
+        // Ordering by a column with NULLs: SQLite sorts NULLs first ascending, last descending,
+        // ties broken by the event id. Pages must neither skip nor repeat rows.
+        let all_items = ITEMS as usize + null_items.len();
+        let non_null = (0..ITEMS as u64).collect::<Vec<_>>();
+        let nulls = null_items.iter().map(|&i| i as u64).collect::<Vec<_>>();
+        for (direction, expected) in [
+            ("ASC", [nulls.clone(), non_null.clone()].concat()),
+            (
+                "DESC",
+                [
+                    non_null.iter().rev().copied().collect::<Vec<_>>(),
+                    nulls.iter().rev().copied().collect(),
+                ]
+                .concat(),
+            ),
+        ] {
+            let mut listing = Vec::new();
+            let mut after = String::new();
+            for page in 0.. {
+                assert!(page <= all_items, "pagination did not terminate");
+                let connection = items_query(
+                    &schema,
+                    &format!("(first: 4, order: {{field: AMOUNT, direction: {direction}}}{after})"),
+                )
+                .await;
+                assert_eq!(
+                    connection["pageInfo"]["hasPreviousPage"],
+                    !after.is_empty(),
+                    "{direction} page {page}"
+                );
+                listing.extend(item_ids(&connection));
+                if connection["pageInfo"]["hasNextPage"] == false {
+                    break;
+                }
+                after = format!(", after: {}", connection["pageInfo"]["endCursor"]);
+            }
+            assert_eq!(listing, expected, "{direction}");
+        }
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
     async fn invalid_filter_values_are_rejected(pool: SqlitePool) {
         let schema = setup(&pool).await;
 
