@@ -1,6 +1,8 @@
 pub const DATETIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%SZ";
 
 pub const DEFAULT_LIMIT: u64 = 10;
+/// Upper bound for `first`, `last` and `limit` connection arguments.
+pub const MAX_PAGE_SIZE: u64 = 10_000;
 pub const BOOLEAN_TRUE: i64 = 1;
 
 pub const ENTITY_TABLE: &str = "entities";

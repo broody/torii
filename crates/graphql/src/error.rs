@@ -13,4 +13,6 @@ pub enum ExtractError {
     NotFelt(String),
     #[error("Not a number: {0}")]
     NotNumber(String),
+    #[error("Not a non-negative integer: {0}")]
+    NotUnsigned(String),
 }

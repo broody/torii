@@ -17,7 +17,9 @@ impl ExtractFromIndexMap for u64 {
             .get(input)
             .ok_or_else(|| ExtractError::NotFound(input.to_string()))?;
         match value {
-            Value::Number(n) => Ok(n.as_u64().unwrap()),
+            Value::Number(n) => n
+                .as_u64()
+                .ok_or_else(|| ExtractError::NotUnsigned(input.to_string())),
             _ => Err(ExtractError::NotNumber(input.to_string())),
         }
     }
@@ -81,4 +83,29 @@ pub fn field_name_from_names(namespace: &str, model_name: &str) -> String {
 
 pub fn type_name_from_names(namespace: &str, model_name: &str) -> String {
     format!("{}_{}", namespace, model_name)
+}
+
+#[cfg(test)]
+mod tests {
+    use async_graphql::Name;
+
+    use super::*;
+
+    #[test]
+    fn extracting_negative_number_as_u64_errors() {
+        let values = ValueMapping::from([
+            (Name::new("negative"), Value::from(-1)),
+            (Name::new("positive"), Value::from(3)),
+        ]);
+
+        assert!(matches!(
+            extract::<u64>(&values, "negative"),
+            Err(ExtractError::NotUnsigned(_))
+        ));
+        assert_eq!(extract::<u64>(&values, "positive").unwrap(), 3);
+        assert!(matches!(
+            extract::<u64>(&values, "missing"),
+            Err(ExtractError::NotFound(_))
+        ));
+    }
 }

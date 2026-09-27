@@ -7,7 +7,7 @@ use sqlx::Row;
 
 use self::page_info::PageInfoObject;
 use super::BasicObject;
-use crate::constants::PAGE_INFO_TYPE_NAME;
+use crate::constants::{MAX_PAGE_SIZE, PAGE_INFO_TYPE_NAME};
 use crate::query::order::Order;
 use crate::query::value_mapping_from_row;
 use crate::types::{GraphqlType, TypeData, TypeMapping, ValueMapping};
@@ -74,12 +74,33 @@ impl BasicObject for ConnectionObject {
 }
 
 pub fn parse_connection_arguments(ctx: &ResolverContext<'_>) -> Result<ConnectionArguments, Error> {
-    let first: Option<u64> = extract::<u64>(ctx.args.as_index_map(), "first").ok();
-    let last = extract::<u64>(ctx.args.as_index_map(), "last").ok();
-    let after = extract::<String>(ctx.args.as_index_map(), "after").ok();
-    let before = extract::<String>(ctx.args.as_index_map(), "before").ok();
-    let offset = extract::<u64>(ctx.args.as_index_map(), "offset").ok();
-    let limit = extract::<u64>(ctx.args.as_index_map(), "limit").ok();
+    connection_arguments_from_map(ctx.args.as_index_map())
+}
+
+/// Reads an optional non-negative integer argument, capped at `max` when given.
+fn page_argument(args: &ValueMapping, name: &str, max: Option<u64>) -> Result<Option<u64>, Error> {
+    if matches!(args.get(name), None | Some(Value::Null)) {
+        return Ok(None);
+    }
+
+    let value = extract::<u64>(args, name)
+        .map_err(|_| Error::new(format!("`{name}` must be a non-negative integer.")))?;
+
+    match max {
+        Some(max) if value > max => Err(Error::new(format!(
+            "`{name}` must not exceed {max}, got {value}."
+        ))),
+        _ => Ok(Some(value)),
+    }
+}
+
+fn connection_arguments_from_map(args: &ValueMapping) -> Result<ConnectionArguments, Error> {
+    let first = page_argument(args, "first", Some(MAX_PAGE_SIZE))?;
+    let last = page_argument(args, "last", Some(MAX_PAGE_SIZE))?;
+    let after = extract::<String>(args, "after").ok();
+    let before = extract::<String>(args, "before").ok();
+    let offset = page_argument(args, "offset", None)?;
+    let limit = page_argument(args, "limit", Some(MAX_PAGE_SIZE))?;
 
     if first.is_some() && last.is_some() {
         return Err(
@@ -171,4 +192,64 @@ pub fn connection_output(
         (Name::new("edges"), Value::List(model_edges?)),
         (Name::new("pageInfo"), PageInfoObject::value(page_info)),
     ]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn arguments(values: &[(&str, Value)]) -> Result<ConnectionArguments, Error> {
+        let args = values
+            .iter()
+            .map(|(name, value)| (Name::new(name), value.clone()))
+            .collect::<ValueMapping>();
+        connection_arguments_from_map(&args)
+    }
+
+    #[test]
+    fn page_arguments_are_parsed() {
+        let args = arguments(&[("first", Value::from(5)), ("after", Value::from("c"))]).unwrap();
+        assert_eq!(args.first, Some(5));
+        assert_eq!(args.after.as_deref(), Some("c"));
+
+        let args = arguments(&[
+            ("limit", Value::from(MAX_PAGE_SIZE)),
+            ("offset", Value::from(20_000)),
+        ])
+        .unwrap();
+        assert_eq!(args.limit, Some(MAX_PAGE_SIZE));
+        assert_eq!(args.offset, Some(20_000));
+
+        // explicit nulls are the same as missing arguments
+        let args = arguments(&[("first", Value::Null), ("last", Value::Null)]).unwrap();
+        assert_eq!(args.first, None);
+        assert_eq!(args.last, None);
+    }
+
+    #[test]
+    fn negative_page_arguments_are_rejected() {
+        for name in ["first", "last", "offset", "limit"] {
+            let err = arguments(&[(name, Value::from(-1))]).err().unwrap();
+            assert_eq!(
+                err.message,
+                format!("`{name}` must be a non-negative integer.")
+            );
+        }
+    }
+
+    #[test]
+    fn page_sizes_above_max_are_rejected() {
+        for name in ["first", "last", "limit"] {
+            let err = arguments(&[(name, Value::from(MAX_PAGE_SIZE + 1))])
+                .err()
+                .unwrap();
+            assert_eq!(
+                err.message,
+                format!(
+                    "`{name}` must not exceed {MAX_PAGE_SIZE}, got {}.",
+                    MAX_PAGE_SIZE + 1
+                )
+            );
+        }
+    }
 }
