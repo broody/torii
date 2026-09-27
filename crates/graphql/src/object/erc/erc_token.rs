@@ -14,7 +14,7 @@ use torii_broker::MemoryBroker;
 use torii_sqlite::utils::{felt_and_u256_to_sql_string, felt_to_sql_string};
 use tracing::{debug, warn};
 
-use super::{handle_cursor, map_token, TokenColumns, TokenMappingError};
+use super::{handle_cursor, map_token, mappable_token_condition, TokenColumns, TokenMappingError};
 use crate::constants::{
     DEFAULT_LIMIT, ERC1155_TOKEN_NAME, ERC1155_TYPE_NAME, ERC20_TOKEN_NAME, ERC20_TYPE_NAME,
     ERC721_TOKEN_NAME, ERC721_TYPE_NAME, ID_COLUMN,
@@ -234,24 +234,50 @@ impl BasicObject for TokenObject {
     }
 }
 
+const TOKENS_FROM: &str =
+    "FROM tokens t JOIN contracts c ON t.contract_address = c.contract_address";
+
+/// Conditions (and their bound values) shared by the `tokens` count and page queries.
+///
+/// Contract-level rows of ERC721/ERC1155 collections are not individual tokens and are excluded,
+/// like the gRPC `tokens` endpoint does. ERC20 tokens only have a contract-level row and are kept.
+fn token_conditions(contract_address: Option<String>) -> (Vec<String>, Vec<String>) {
+    let mut conditions = vec![mappable_token_condition("t.id")];
+    let mut binds = vec![];
+    if let Some(addr) = contract_address {
+        conditions.push("t.contract_address = ?".to_string());
+        binds.push(addr);
+    }
+    (conditions, binds)
+}
+
+async fn count_tokens(
+    conn: &mut SqliteConnection,
+    contract_address: Option<String>,
+) -> sqlx::Result<i64> {
+    let (conditions, binds) = token_conditions(contract_address);
+    let query = format!(
+        "SELECT COUNT(*) {TOKENS_FROM} WHERE {}",
+        conditions.join(" AND ")
+    );
+
+    let mut count_query = sqlx::query_scalar(&query);
+    for value in &binds {
+        count_query = count_query.bind(value);
+    }
+    count_query.fetch_one(conn).await
+}
+
 async fn fetch_tokens(
     conn: &mut SqliteConnection,
     contract_address: Option<String>,
     connection: &ConnectionArguments,
     total_count: i64,
 ) -> sqlx::Result<(Vec<SqliteRow>, PageInfo)> {
-    let mut query = "SELECT t.*, c.contract_type 
-                    FROM tokens t 
-                    JOIN contracts c ON t.contract_address = c.contract_address"
-        .to_string();
+    let mut query = format!("SELECT t.*, c.contract_type {TOKENS_FROM}");
 
     let id_column = format!("t.{}", ID_COLUMN);
-    let mut conditions = vec![];
-    let mut binds = vec![];
-    if let Some(addr) = contract_address {
-        conditions.push("t.contract_address = ?".to_string());
-        binds.push(addr);
-    }
+    let (mut conditions, mut binds) = token_conditions(contract_address);
 
     let mut cursor_param = &connection.after;
     if let Some(after_cursor) = &connection.after {
@@ -360,7 +386,7 @@ async fn fetch_tokens(
         Ok((data, page_info))
     } else {
         let offset = connection.offset.unwrap_or(0);
-        if 1 < offset && offset < total_count as u64 {
+        if 0 < offset && offset < total_count as u64 {
             page_info.has_previous_page = true;
         }
         if limit + offset < total_count as u64 {
@@ -398,21 +424,8 @@ impl ResolvableObject for TokenObject {
                                 _ => None,
                             };
 
-                            let total_count: i64 =
-                                match &contract_address {
-                                    Some(addr) => sqlx::query_scalar(
-                                        "SELECT COUNT(*) FROM tokens t WHERE t.contract_address \
-                                         = ?",
-                                    )
-                                    .bind(addr)
-                                    .fetch_one(&mut *conn)
-                                    .await?,
-                                    None => {
-                                        sqlx::query_scalar("SELECT COUNT(*) FROM tokens t")
-                                            .fetch_one(&mut *conn)
-                                            .await?
-                                    }
-                                };
+                            let total_count =
+                                count_tokens(&mut conn, contract_address.clone()).await?;
 
                             let (data, page_info) =
                                 fetch_tokens(&mut conn, contract_address, &connection, total_count)

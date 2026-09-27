@@ -8,17 +8,19 @@ use convert_case::{Case, Casing};
 use serde::Deserialize;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{FromRow, Pool, Row, Sqlite, SqliteConnection};
+use starknet::core::types::U256;
 use starknet_crypto::Felt;
 use tokio_stream::StreamExt;
 use torii_broker::types::TokenBalanceUpdate;
 use torii_broker::MemoryBroker;
 use torii_sqlite::constants::TOKEN_BALANCE_TABLE;
-use torii_sqlite::utils::{felt_and_u256_to_sql_string, felt_to_sql_string};
+use torii_sqlite::utils::{felt_and_u256_to_sql_string, felt_to_sql_string, u256_to_sql_string};
 use tracing::{debug, warn};
 
 use super::erc_token::ErcTokenType;
 use super::{
-    handle_cursor, map_token, Connection, ConnectionEdge, TokenColumns, TokenMappingError,
+    handle_cursor, map_token, mappable_token_condition, Connection, ConnectionEdge, TokenColumns,
+    TokenMappingError,
 };
 use crate::constants::{DEFAULT_LIMIT, ID_COLUMN, TOKEN_BALANCE_NAME, TOKEN_BALANCE_TYPE_NAME};
 use crate::mapping::TOKEN_BALANCE_TYPE_MAPPING;
@@ -27,8 +29,6 @@ use crate::object::connection::{
     connection_arguments, cursor, parse_connection_arguments, ConnectionArguments,
 };
 use crate::object::{BasicObject, ResolvableObject};
-use crate::query::data::count_rows;
-use crate::query::filter::{Comparator, Filter, FilterValue};
 use crate::query::order::{CursorDirection, Direction};
 use crate::types::TypeMapping;
 use crate::utils::extract;
@@ -70,14 +70,7 @@ impl ResolvableObject for ErcBalanceObject {
                         &account_address.to_case(Case::Camel),
                     )?;
 
-                    let filter = vec![Filter {
-                        field: "account_address".to_string(),
-                        comparator: Comparator::Eq,
-                        value: FilterValue::String(felt_to_sql_string(&address)),
-                    }];
-
-                    let total_count =
-                        count_rows(&mut conn, TOKEN_BALANCE_TABLE, &None, &Some(filter)).await?;
+                    let total_count = count_token_balances(&mut conn, address).await?;
 
                     let (data, page_info) =
                         fetch_token_balances(&mut conn, address, &connection, total_count).await?;
@@ -187,31 +180,59 @@ impl ResolvableObject for ErcBalanceObject {
     }
 }
 
+fn balances_from() -> String {
+    format!(
+        "FROM {TOKEN_BALANCE_TABLE} b JOIN tokens t ON b.token_id = t.id JOIN contracts c ON \
+         t.contract_address = c.contract_address"
+    )
+}
+
+/// Conditions (and their bound values) shared by the `tokenBalances` count and page queries:
+/// balances of the given account, excluding NFTs the account no longer holds and rows that can't
+/// be mapped to a token (e.g. contract-level balances of NFT collections).
+fn balance_conditions(address: Felt) -> (Vec<String>, Vec<String>) {
+    let conditions = vec![
+        "(b.account_address = ?)".to_string(),
+        mappable_token_condition("b.token_id"),
+        "(UPPER(c.contract_type) = 'ERC20' OR b.balance != ?)".to_string(),
+    ];
+    let binds = vec![
+        felt_to_sql_string(&address),
+        u256_to_sql_string(&U256::from(0u8)),
+    ];
+    (conditions, binds)
+}
+
+async fn count_token_balances(conn: &mut SqliteConnection, address: Felt) -> sqlx::Result<i64> {
+    let (conditions, binds) = balance_conditions(address);
+    let query = format!(
+        "SELECT COUNT(*) {} WHERE {}",
+        balances_from(),
+        conditions.join(" AND ")
+    );
+
+    let mut count_query = sqlx::query_scalar(&query);
+    for value in &binds {
+        count_query = count_query.bind(value);
+    }
+    count_query.fetch_one(conn).await
+}
+
 async fn fetch_token_balances(
     conn: &mut SqliteConnection,
     address: Felt,
     connection: &ConnectionArguments,
     total_count: i64,
 ) -> sqlx::Result<(Vec<SqliteRow>, PageInfo)> {
-    let table_name = TOKEN_BALANCE_TABLE;
     let id_column = format!("b.{}", ID_COLUMN);
 
     let mut query = format!(
         "SELECT b.id, t.contract_address, t.name, t.symbol, t.decimals, b.balance, b.token_id, \
-         t.metadata, c.contract_type
-         FROM {table_name} b
-         JOIN tokens t ON b.token_id = t.id
-         JOIN contracts c ON t.contract_address = c.contract_address"
+         t.metadata, c.contract_type {}",
+        balances_from()
     );
 
-    // Only select balances for the given account address and non-zero balances.
-    let mut conditions = vec![
-        "(b.account_address = ?)".to_string(),
-        "(t.token_id IS NULL OR b.balance != '0x0000000000000000000000000000000000000000000000000000000000000000')"
-            .to_string(),
-    ];
-
-    let mut binds = vec![felt_to_sql_string(&address)];
+    let (mut conditions, mut binds) = balance_conditions(address);
 
     let mut cursor_param = &connection.after;
     if let Some(after_cursor) = &connection.after {
@@ -319,7 +340,7 @@ async fn fetch_token_balances(
         Ok((data, page_info))
     } else {
         let offset = connection.offset.unwrap_or(0);
-        if 1 < offset && offset < total_count as u64 {
+        if 0 < offset && offset < total_count as u64 {
             page_info.has_previous_page = true;
         }
         if limit + offset < total_count as u64 {

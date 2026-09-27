@@ -12,7 +12,8 @@ use tracing::warn;
 
 use super::erc_token::ErcTokenType;
 use super::{
-    handle_cursor, map_token, Connection, ConnectionEdge, TokenColumns, TokenMappingError,
+    handle_cursor, map_token, mappable_token_condition, Connection, ConnectionEdge, TokenColumns,
+    TokenMappingError,
 };
 use crate::constants::{DEFAULT_LIMIT, ID_COLUMN, TOKEN_TRANSFER_NAME, TOKEN_TRANSFER_TYPE_NAME};
 use crate::mapping::TOKEN_TRANSFER_TYPE_MAPPING;
@@ -62,15 +63,7 @@ impl ResolvableObject for ErcTransferObject {
                         &account_address.to_case(Case::Camel),
                     )?;
 
-                    let total_count: (i64,) = sqlx::query_as(&format!(
-                        "SELECT COUNT(*) FROM {TOKEN_TRANSFER_TABLE} WHERE from_address = ? OR \
-                         to_address = ?"
-                    ))
-                    .bind(felt_to_sql_string(&address))
-                    .bind(felt_to_sql_string(&address))
-                    .fetch_one(&mut *conn)
-                    .await?;
-                    let total_count = total_count.0;
+                    let total_count = count_token_transfers(&mut conn, address).await?;
 
                     let (data, page_info) =
                         fetch_token_transfers(&mut conn, address, &connection, total_count).await?;
@@ -87,45 +80,65 @@ impl ResolvableObject for ErcTransferObject {
     }
 }
 
+/// `FROM` clause of the token transfer queries, joining the tables [`TransferQueryResultRaw`]
+/// reads from.
+pub(crate) fn transfers_from() -> String {
+    format!(
+        "FROM {TOKEN_TRANSFER_TABLE} et JOIN tokens t ON et.token_id = t.id JOIN contracts c ON \
+         t.contract_address = c.contract_address"
+    )
+}
+
+/// Columns read by [`TransferQueryResultRaw`].
+pub(crate) const TRANSFER_COLUMNS: &str = "et.id, et.contract_address, et.from_address, \
+                                           et.to_address, et.amount, et.token_id, \
+                                           et.executed_at, t.name, t.symbol, t.decimals, \
+                                           c.contract_type, t.metadata";
+
+/// Keeps the transfers [`token_transfer_mapping_from_row`] can map.
+///
+/// Transfers of NFTs whose metadata couldn't be fetched (stored as `''`) are kept: their metadata
+/// fields are null.
+pub(crate) fn mappable_transfer_condition() -> String {
+    mappable_token_condition("et.token_id")
+}
+
+/// Conditions (and their bound values) shared by the `tokenTransfers` count and page queries.
+fn transfer_conditions(address: Felt) -> (Vec<String>, Vec<String>) {
+    let conditions = vec![
+        "(et.from_address = ? OR et.to_address = ?)".to_string(),
+        mappable_transfer_condition(),
+    ];
+    let binds = vec![felt_to_sql_string(&address), felt_to_sql_string(&address)];
+    (conditions, binds)
+}
+
+async fn count_token_transfers(conn: &mut SqliteConnection, address: Felt) -> sqlx::Result<i64> {
+    let (conditions, binds) = transfer_conditions(address);
+    let query = format!(
+        "SELECT COUNT(*) {} WHERE {}",
+        transfers_from(),
+        conditions.join(" AND ")
+    );
+
+    let mut count_query = sqlx::query_scalar(&query);
+    for value in &binds {
+        count_query = count_query.bind(value);
+    }
+    count_query.fetch_one(conn).await
+}
+
 async fn fetch_token_transfers(
     conn: &mut SqliteConnection,
     address: Felt,
     connection: &ConnectionArguments,
     total_count: i64,
 ) -> sqlx::Result<(Vec<SqliteRow>, PageInfo)> {
-    let table_name = TOKEN_TRANSFER_TABLE;
     let id_column = format!("et.{}", ID_COLUMN);
 
-    let mut query = format!(
-        r#"
-SELECT
-    et.id,
-    et.contract_address,
-    et.from_address,
-    et.to_address,
-    et.amount,
-    et.token_id,
-    et.executed_at,
-    t.name,
-    t.symbol,
-    t.decimals,
-    c.contract_type,
-    t.metadata
-FROM
-    {table_name} et
-JOIN
-    tokens t ON et.token_id = t.id
-JOIN
-    contracts c ON t.contract_address = c.contract_address
-"#,
-    );
+    let mut query = format!("SELECT {TRANSFER_COLUMNS} {}", transfers_from());
 
-    let mut conditions = vec![
-        "(et.from_address = ? OR et.to_address = ?)".to_string(),
-        "(t.metadata IS NULL OR length(t.metadata) > 0)".to_string(),
-    ];
-
-    let mut binds = vec![felt_to_sql_string(&address), felt_to_sql_string(&address)];
+    let (mut conditions, mut binds) = transfer_conditions(address);
 
     let mut cursor_param = &connection.after;
     if let Some(after_cursor) = &connection.after {
@@ -233,7 +246,7 @@ JOIN
         Ok((data, page_info))
     } else {
         let offset = connection.offset.unwrap_or(0);
-        if 1 < offset && offset < total_count as u64 {
+        if 0 < offset && offset < total_count as u64 {
             page_info.has_previous_page = true;
         }
         if limit + offset < total_count as u64 {

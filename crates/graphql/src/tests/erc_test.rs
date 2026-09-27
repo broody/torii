@@ -317,6 +317,174 @@ mod tests {
         assert!(res.errors[0].message.contains("Invalid contractAddress"));
     }
 
+    const ERC20: Felt = Felt::from_hex_unchecked("0x50");
+    const ERC20_B: Felt = Felt::from_hex_unchecked("0x51");
+    const ERC721: Felt = Felt::from_hex_unchecked("0x52");
+    const ERC1155: Felt = Felt::from_hex_unchecked("0x53");
+    const NOT_A_TOKEN: Felt = Felt::from_hex_unchecked("0x54");
+    const NFT_METADATA: &str = r#"{"name":"a \"quoted\" name","description":"line\nbreak"}"#;
+
+    /// Tokens of every kind, including the contract-level rows every ERC721/ERC1155 collection
+    /// gets and a token row of a contract that is not a token contract.
+    async fn insert_tokens(pool: &SqlitePool) {
+        for (contract, contract_type) in [
+            (ERC20, "ERC20"),
+            (ERC20_B, "ERC20"),
+            (ERC721, "ERC721"),
+            (ERC1155, "ERC1155"),
+        ] {
+            insert_contract(pool, contract, contract_type).await;
+            insert_token(pool, contract, None, Some(r#"{"name":"collection"}"#)).await;
+        }
+        insert_token(pool, ERC721, Some(1), Some(NFT_METADATA)).await;
+        // Failed metadata fetches are stored as ''.
+        insert_token(pool, ERC721, Some(2), Some("")).await;
+        insert_token(pool, ERC1155, Some(1), Some("")).await;
+        insert_contract(pool, NOT_A_TOKEN, "OTHER").await;
+        insert_token(pool, NOT_A_TOKEN, None, None).await;
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn test_tokens_skip_contract_level_nft_rows(pool: SqlitePool) {
+        let schema = schema(&pool).await;
+        insert_tokens(&pool).await;
+
+        let connection = tokens(&schema, "").await;
+        let mut expected = vec![
+            felt_to_sql_string(&ERC20),
+            felt_to_sql_string(&ERC20_B),
+            token_key(ERC721, Some(1)),
+            token_key(ERC721, Some(2)),
+            token_key(ERC1155, Some(1)),
+        ];
+        expected.reverse();
+        assert_eq!(keys(&connection, token_of), expected);
+        assert_eq!(connection["totalCount"], 5);
+        assert_eq!(connection["pageInfo"]["hasNextPage"], false);
+
+        let connection = tokens(&schema, &format!("(contractAddress: \"{ERC721:#x}\")")).await;
+        assert_eq!(connection["totalCount"], 2);
+        assert_eq!(connection["edges"].as_array().unwrap().len(), 2);
+
+        // Strings from the metadata are returned verbatim, not JSON-escaped.
+        let token = get(&connection["edges"][1], &["node", "tokenMetadata"]);
+        assert_eq!(token["metadataName"], "a \"quoted\" name");
+        assert_eq!(token["metadataDescription"], "line\nbreak");
+
+        // Looking up the contract-level row of a collection is an error, not a panic.
+        let query = |id: String| format!("{{ token(id: \"{id}\") {{ {TOKEN_FIELDS} }} }}");
+        let res = schema.execute(query(felt_to_sql_string(&ERC721))).await;
+        assert_eq!(res.errors.len(), 1);
+        assert!(
+            res.errors[0].message.contains("contract-level"),
+            "{:?}",
+            res.errors
+        );
+
+        let res = schema.execute(query(token_key(ERC721, Some(2)))).await;
+        assert!(res.errors.is_empty(), "{:?}", res.errors);
+        let token = res.data.into_json().unwrap()["token"]["tokenMetadata"].clone();
+        assert_eq!(token["__typename"], "ERC721__Token");
+        assert_eq!(token["metadataName"], Value::Null);
+        assert_eq!(token["imagePath"], "");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn test_offset_pagination_page_info(pool: SqlitePool) {
+        let schema = schema(&pool).await;
+        insert_tokens(&pool).await;
+
+        for (offset, has_previous_page, has_next_page) in
+            [(0, false, true), (1, true, true), (3, true, false)]
+        {
+            let connection = tokens(&schema, &format!("(offset: {offset}, limit: 2)")).await;
+            assert_eq!(connection["totalCount"], 5);
+            assert_eq!(
+                connection["pageInfo"]["hasPreviousPage"], has_previous_page,
+                "offset {offset}"
+            );
+            assert_eq!(
+                connection["pageInfo"]["hasNextPage"], has_next_page,
+                "offset {offset}"
+            );
+        }
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn test_token_balances_count_matches_page(pool: SqlitePool) {
+        let schema = schema(&pool).await;
+        insert_tokens(&pool).await;
+        insert_balance(&pool, ACCOUNT, ERC20, None, 5).await;
+        // ERC20 balances are listed even when empty, NFTs only while held.
+        insert_balance(&pool, ACCOUNT, ERC20_B, None, 0).await;
+        insert_balance(&pool, ACCOUNT, ERC721, Some(1), 1).await;
+        insert_balance(&pool, ACCOUNT, ERC721, Some(2), 0).await;
+        insert_balance(&pool, ACCOUNT, ERC1155, Some(1), 3).await;
+        // Contract-level balance of a collection, and a balance of a non-token contract.
+        insert_balance(&pool, ACCOUNT, ERC721, None, 1).await;
+        insert_balance(&pool, ACCOUNT, NOT_A_TOKEN, None, 1).await;
+        insert_balance(&pool, OTHER, ERC20, None, 1).await;
+
+        let connection = token_balances(&schema, ACCOUNT, "").await;
+        let mut expected = vec![
+            felt_to_sql_string(&ERC20),
+            felt_to_sql_string(&ERC20_B),
+            token_key(ERC721, Some(1)),
+            token_key(ERC1155, Some(1)),
+        ];
+        expected.reverse();
+        assert_eq!(keys(&connection, token_of), expected);
+        assert_eq!(connection["totalCount"], 4);
+        assert_eq!(connection["pageInfo"]["hasNextPage"], false);
+
+        let connection = token_balances(&schema, ACCOUNT, ", limit: 3").await;
+        assert_eq!(connection["edges"].as_array().unwrap().len(), 3);
+        assert_eq!(connection["pageInfo"]["hasNextPage"], true);
+        let connection = token_balances(&schema, ACCOUNT, ", limit: 4").await;
+        assert_eq!(connection["pageInfo"]["hasNextPage"], false);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn test_token_transfers_count_matches_page(pool: SqlitePool) {
+        let schema = schema(&pool).await;
+        insert_tokens(&pool).await;
+        let transfers = [
+            (ERC20, None),
+            (ERC721, Some(1)),
+            // NFTs whose metadata couldn't be fetched are still listed.
+            (ERC721, Some(2)),
+            (ERC1155, Some(1)),
+            // Transfer of a non-token contract.
+            (NOT_A_TOKEN, None),
+        ];
+        for (block, (contract, token_id)) in (1..).zip(transfers) {
+            insert_transfer(
+                &pool,
+                block,
+                Felt::from(block),
+                contract,
+                token_id,
+                OTHER,
+                ACCOUNT,
+                1,
+            )
+            .await;
+        }
+
+        let connection = token_transfers(&schema, ACCOUNT, "").await;
+        let expected: Vec<String> = (1..=4)
+            .rev()
+            .map(|block| felt_to_sql_string(&Felt::from(block)))
+            .collect();
+        assert_eq!(keys(&connection, transaction_hash_of), expected);
+        assert_eq!(connection["totalCount"], 4);
+        assert_eq!(connection["pageInfo"]["hasNextPage"], false);
+
+        let token = get(&connection["edges"][1], &["node", "tokenMetadata"]);
+        assert_eq!(token["tokenId"], u256_to_sql_string(&U256::from(2u8)));
+        assert_eq!(token["metadataName"], Value::Null);
+    }
+
     // Balance ids (`account/contract:token_id`) contain '/', which `cursor::decode` can't handle
     // yet; un-ignore once the connection cursor encoding supports it.
     #[ignore = "requires cursor::decode support for ids containing '/'"]

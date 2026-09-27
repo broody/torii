@@ -25,6 +25,19 @@ fn handle_cursor(
     }
 }
 
+/// SQL condition keeping only the rows [`map_token`] can represent: ERC20 tokens and individual
+/// ERC721/ERC1155 tokens. Contract-level rows of NFT collections and other contract types are
+/// excluded, so that count and page queries agree and no row is dropped after fetching.
+///
+/// Expects the `contracts` table to be joined as `c`; `token_key_column` holds the `tokens.id` of
+/// the row's token.
+fn mappable_token_condition(token_key_column: &str) -> String {
+    format!(
+        "(UPPER(c.contract_type) = 'ERC20' OR (UPPER(c.contract_type) IN ('ERC721', 'ERC1155') \
+         AND instr({token_key_column}, ':') > 0))"
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct ConnectionEdge<T> {
     pub node: T,
