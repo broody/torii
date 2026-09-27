@@ -139,4 +139,134 @@ mod tests {
             .await
         );
     }
+
+    /// The standard introspection query (graphql-js `getIntrospectionQuery` with every option
+    /// async-graphql supports enabled, and the deeper 9-level `TypeRef` of graphql-js 17).
+    const INTROSPECTION_QUERY: &str = r#"
+        query IntrospectionQuery {
+          __schema {
+            description
+            queryType { name }
+            mutationType { name }
+            subscriptionType { name }
+            types { ...FullType }
+            directives {
+              name
+              description
+              isRepeatable
+              locations
+              args { ...InputValue }
+            }
+          }
+        }
+
+        fragment FullType on __Type {
+          kind
+          name
+          description
+          specifiedByURL
+          isOneOf
+          fields(includeDeprecated: true) {
+            name
+            description
+            args { ...InputValue }
+            type { ...TypeRef }
+            isDeprecated
+            deprecationReason
+          }
+          inputFields { ...InputValue }
+          interfaces { ...TypeRef }
+          enumValues(includeDeprecated: true) {
+            name
+            description
+            isDeprecated
+            deprecationReason
+          }
+          possibleTypes { ...TypeRef }
+        }
+
+        fragment InputValue on __InputValue {
+          name
+          description
+          type { ...TypeRef }
+          defaultValue
+        }
+
+        fragment TypeRef on __Type {
+          kind
+          name
+          ofType {
+            kind
+            name
+            ofType {
+              kind
+              name
+              ofType {
+                kind
+                name
+                ofType {
+                  kind
+                  name
+                  ofType {
+                    kind
+                    name
+                    ofType {
+                      kind
+                      name
+                      ofType {
+                        kind
+                        name
+                        ofType {
+                          kind
+                          name
+                          ofType {
+                            kind
+                            name
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+    "#;
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[serial]
+    async fn test_introspection_query_within_limits(pool: SqlitePool) {
+        let (db, provider, _executor_shutdown) = setup_sql(&pool).await;
+        model_fixtures(&db).await;
+        let schema = build_test_schema(&pool, &db, provider).await.unwrap();
+
+        let response = schema.execute(INTROSPECTION_QUERY).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let data = response.data.into_json().unwrap();
+        assert!(!data["__schema"]["types"].as_array().unwrap().is_empty());
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[serial]
+    async fn test_overly_deep_query_is_rejected(pool: SqlitePool) {
+        let (db, provider, _executor_shutdown) = setup_sql(&pool).await;
+        let schema = build_test_schema(&pool, &db, provider).await.unwrap();
+
+        let depth = crate::schema::MAX_QUERY_DEPTH + 1;
+        let query = format!(
+            "{{ __schema {{ types {} name {} }} }}",
+            "{ ofType ".repeat(depth - 2),
+            "}".repeat(depth - 2)
+        );
+        let response = schema.execute(query).await;
+        assert!(
+            response
+                .errors
+                .iter()
+                .any(|e| e.message.contains("nested too deep")),
+            "{:?}",
+            response.errors
+        );
+    }
 }

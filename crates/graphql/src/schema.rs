@@ -36,6 +36,16 @@ use crate::object::transaction::{CallObject, TransactionObject};
 use crate::object::{BasicObject, ObjectVariant};
 use crate::query::build_type_mapping;
 
+/// Maximum field nesting depth of a query. The standard introspection query needs up to 15 levels
+/// (with a 9-level `TypeRef`), which leaves room for deeply nested model structs below
+/// `entities { edges { node { models } } }`.
+pub const MAX_QUERY_DEPTH: usize = 24;
+
+/// Maximum complexity of a query (the number of selected fields, with fragments expanded). The
+/// standard introspection query is ~220; this leaves room for queries selecting every field of
+/// hundreds of models.
+pub const MAX_QUERY_COMPLEXITY: usize = 10_000;
+
 // The graphql schema is built dynamically at runtime, this is because we won't know the schema of
 // the models until runtime. There are however, predefined objects such as entities and
 // events, their schema is known but we generate them dynamically as well because async-graphql
@@ -132,6 +142,8 @@ pub async fn build_schema<P: Provider + Sync + Send + 'static>(
         .register(query_root)
         .register(mutation_root)
         .register(subscription_root)
+        .limit_depth(MAX_QUERY_DEPTH)
+        .limit_complexity(MAX_QUERY_COMPLEXITY)
         .data(pool.clone())
         .data(messaging as Arc<dyn MessagingTrait>)
         .data(storage)
