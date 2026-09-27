@@ -10,15 +10,16 @@ use torii_sqlite::utils::felt_to_sql_string;
 use torii_storage::utils::parse_event_id;
 use tracing::warn;
 
-use super::erc_token::{Erc20Token, ErcTokenType};
-use super::{handle_cursor, Connection, ConnectionEdge};
+use super::erc_token::ErcTokenType;
+use super::{
+    handle_cursor, map_token, Connection, ConnectionEdge, TokenColumns, TokenMappingError,
+};
 use crate::constants::{DEFAULT_LIMIT, ID_COLUMN, TOKEN_TRANSFER_NAME, TOKEN_TRANSFER_TYPE_NAME};
 use crate::mapping::TOKEN_TRANSFER_TYPE_MAPPING;
 use crate::object::connection::page_info::PageInfoObject;
 use crate::object::connection::{
     connection_arguments, cursor, parse_connection_arguments, ConnectionArguments,
 };
-use crate::object::erc::erc_token::{Erc1155Token, Erc721Token};
 use crate::object::{BasicObject, ResolvableObject};
 use crate::query::order::{CursorDirection, Direction};
 use crate::types::TypeMapping;
@@ -280,133 +281,28 @@ fn token_transfers_connection_output<'a>(
 /// Transforms a TransferQueryResultRaw into a TokenTransferNode
 pub fn token_transfer_mapping_from_row(
     row: &TransferQueryResultRaw,
-) -> Result<TokenTransferNode, String> {
+) -> Result<TokenTransferNode, TokenMappingError> {
     let (_, transaction_hash, _, _) = parse_event_id(&row.id);
     let transaction_hash = felt_to_sql_string(&transaction_hash);
 
-    match row.contract_type.to_lowercase().as_str() {
-        "erc20" => {
-            let token_metadata = ErcTokenType::Erc20(Erc20Token {
-                contract_address: row.contract_address.clone(),
-                name: row.name.clone(),
-                symbol: row.symbol.clone(),
-                decimals: row.decimals,
-                amount: row.amount.clone(),
-            });
+    let token_metadata = map_token(&TokenColumns {
+        contract_type: &row.contract_type,
+        token_key: &row.token_id,
+        contract_address: &row.contract_address,
+        name: &row.name,
+        symbol: &row.symbol,
+        decimals: row.decimals,
+        metadata: &row.metadata,
+        amount: &row.amount,
+    })?;
 
-            Ok(TokenTransferNode {
-                from: row.from_address.clone(),
-                to: row.to_address.clone(),
-                executed_at: row.executed_at.clone(),
-                token_metadata,
-                transaction_hash,
-            })
-        }
-        "erc721" => {
-            // contract_address:token_id
-            let token_id = row.token_id.split(':').collect::<Vec<&str>>();
-            if token_id.len() != 2 {
-                return Err(format!("Invalid token_id format: {}", row.token_id));
-            }
-
-            let metadata_str = &row.metadata;
-            let metadata: serde_json::Value = match serde_json::from_str(metadata_str) {
-                Ok(value) => value,
-                Err(e) => return Err(format!("Failed to parse metadata as JSON: {}", e)),
-            };
-
-            let metadata_name = metadata
-                .get("name")
-                .map(|v| v.to_string().trim_matches('"').to_string());
-            let metadata_description = metadata
-                .get("description")
-                .map(|v| v.to_string().trim_matches('"').to_string());
-            let metadata_attributes = metadata
-                .get("attributes")
-                .map(|v| v.to_string().trim_matches('"').to_string());
-
-            let image_path = format!("{}/{}", token_id.join("/"), "image");
-
-            let token_metadata = ErcTokenType::Erc721(Erc721Token {
-                name: row.name.clone(),
-                metadata: metadata_str.to_owned(),
-                contract_address: row.contract_address.clone(),
-                symbol: row.symbol.clone(),
-                token_id: token_id[1].to_string(),
-                metadata_name,
-                metadata_description,
-                metadata_attributes,
-                image_path,
-            });
-
-            Ok(TokenTransferNode {
-                from: row.from_address.clone(),
-                to: row.to_address.clone(),
-                executed_at: row.executed_at.clone(),
-                token_metadata,
-                transaction_hash,
-            })
-        }
-        "erc1155" => {
-            // contract_address:token_id
-            let token_id = row.token_id.split(':').collect::<Vec<&str>>();
-            if token_id.len() != 2 {
-                return Err(format!("Invalid token_id format: {}", row.token_id));
-            }
-
-            let metadata_str = &row.metadata;
-            let (metadata_name, metadata_description, metadata_attributes, image_path) =
-                if metadata_str.is_empty() {
-                    (None, None, None, String::new())
-                } else {
-                    let metadata: serde_json::Value = match serde_json::from_str(metadata_str) {
-                        Ok(value) => value,
-                        Err(e) => return Err(format!("Failed to parse metadata as JSON: {}", e)),
-                    };
-
-                    let metadata_name = metadata
-                        .get("name")
-                        .map(|v| v.to_string().trim_matches('"').to_string());
-                    let metadata_description = metadata
-                        .get("description")
-                        .map(|v| v.to_string().trim_matches('"').to_string());
-                    let metadata_attributes = metadata
-                        .get("attributes")
-                        .map(|v| v.to_string().trim_matches('"').to_string());
-
-                    let image_path = format!("{}/{}", token_id.join("/"), "image");
-
-                    (
-                        metadata_name,
-                        metadata_description,
-                        metadata_attributes,
-                        image_path,
-                    )
-                };
-
-            let token_metadata = ErcTokenType::Erc1155(Erc1155Token {
-                name: row.name.clone(),
-                metadata: metadata_str.to_owned(),
-                contract_address: row.contract_address.clone(),
-                symbol: row.symbol.clone(),
-                token_id: token_id[1].to_string(),
-                amount: row.amount.clone(),
-                metadata_name,
-                metadata_description,
-                metadata_attributes,
-                image_path,
-            });
-
-            Ok(TokenTransferNode {
-                from: row.from_address.clone(),
-                to: row.to_address.clone(),
-                executed_at: row.executed_at.clone(),
-                token_metadata,
-                transaction_hash,
-            })
-        }
-        _ => Err(format!("Unknown contract type: {}", row.contract_type)),
-    }
+    Ok(TokenTransferNode {
+        from: row.from_address.clone(),
+        to: row.to_address.clone(),
+        executed_at: row.executed_at.clone(),
+        token_metadata,
+        transaction_hash,
+    })
 }
 
 // TODO: This would be required when subscriptions are needed
