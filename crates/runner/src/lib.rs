@@ -37,10 +37,7 @@ use terminal_size::{terminal_size, Height, Width};
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
-use tokio::sync::broadcast::Sender;
 use tokio_stream::StreamExt;
-use torii_broker::types::ModelUpdate;
-use torii_broker::MemoryBroker;
 use torii_cache::InMemoryCache;
 use torii_cli::ToriiArgs;
 use torii_controllers::sync::ControllersSync;
@@ -824,8 +821,8 @@ impl Runner {
 
         let proxy_server = Arc::new(proxy_server);
 
-        let graphql_server = spawn_rebuilding_graphql_server(
-            shutdown_tx.clone(),
+        let graphql_server = run_graphql_server(
+            shutdown_tx.subscribe(),
             readonly_pool.into(),
             proxy_server.clone(),
             messaging.clone(),
@@ -918,7 +915,7 @@ impl Runner {
             res = engine_handle => handle_task!(res, "Engine"),
             res = executor_handle => handle_task!(res, "Executor"),
             res = proxy_server_handle => handle_task!(res, "Proxy server"),
-            res = graphql_server_handle => handle_task!(res, "GraphQL server", void),
+            res = graphql_server_handle => handle_task!(res, "GraphQL server"),
             res = grpc_server_handle => handle_task!(res, "gRPC server"),
             res = libp2p_relay_server_handle => handle_task!(res, "LibP2P relay", void),
             _ = dojo_utils::signal::wait_signals() => {
@@ -936,32 +933,24 @@ impl Runner {
     }
 }
 
-async fn spawn_rebuilding_graphql_server<P: Provider + Sync + Send + Clone + Debug + 'static>(
-    shutdown_tx: Sender<()>,
+/// Runs the GraphQL server until shutdown. The server hot-swaps its schema when models are
+/// registered or upgraded, so its address is only registered with the proxy once.
+async fn run_graphql_server<P: Provider + Sync + Send + Clone + Debug + 'static>(
+    shutdown_rx: broadcast::Receiver<()>,
     pool: Arc<SqlitePool>,
     proxy_server: Arc<Proxy<P>>,
     messaging: Arc<Messaging<P>>,
     storage: Arc<dyn ReadOnlyStorage>,
-) {
-    let mut broker = MemoryBroker::<ModelUpdate>::subscribe();
+) -> anyhow::Result<()> {
+    // Flatten the cause chain into the message: `handle_task!` only keeps the error's `Display`.
+    let (addr, server) = torii_graphql::server::new(shutdown_rx, &pool, messaging, storage)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to start GraphQL server: {e:#}"))?;
 
-    loop {
-        let shutdown_rx = shutdown_tx.subscribe();
-        let (new_addr, new_server) =
-            torii_graphql::server::new(shutdown_rx, &pool, messaging.clone(), storage.clone())
-                .await;
+    proxy_server.set_graphql_addr(addr).await;
 
-        tokio::spawn(new_server);
-
-        proxy_server.set_graphql_addr(new_addr).await;
-
-        // Break the loop if there are no more events
-        if broker.next().await.is_none() {
-            break;
-        } else {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-    }
+    server.await;
+    Ok(())
 }
 
 async fn verify_contracts_deployed(

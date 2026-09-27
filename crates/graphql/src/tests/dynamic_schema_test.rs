@@ -1,15 +1,27 @@
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration;
 
     use anyhow::Result;
-    use async_graphql::dynamic::Schema;
+    use async_graphql::dynamic::{
+        Field, FieldFuture, FieldValue, Object, Schema, Subscription, SubscriptionField,
+        SubscriptionFieldFuture, TypeRef,
+    };
+    use async_graphql::{Executor, Request, Value};
     use serial_test::serial;
     use sqlx::SqlitePool;
     use starknet::providers::jsonrpc::HttpTransport;
     use starknet::providers::JsonRpcClient;
     use starknet_crypto::Felt;
-    use tokio::sync::broadcast;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use tokio::sync::{broadcast, mpsc};
+    use tokio::task::JoinHandle;
+    use tokio_stream::wrappers::UnboundedReceiverStream;
+    use tokio_stream::StreamExt;
     use torii_messaging::Messaging;
     use torii_sqlite::executor::Executor as SqlExecutor;
     use torii_sqlite::Sql;
@@ -17,8 +29,10 @@ mod tests {
     use url::Url;
 
     use crate::schema::build_schema;
+    use crate::server::{self, graphql_filter, rebuild_schema_on_updates, DynamicSchema};
     use crate::tests::model_fixtures;
     use crate::utils;
+
     /// Sets up storage backed by `pool`. The returned sender keeps the SQL executor running.
     async fn setup_sql(
         pool: &SqlitePool,
@@ -268,5 +282,356 @@ mod tests {
             "{:?}",
             response.errors
         );
+    }
+
+    const WAIT_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// A minimal schema whose `version` query/subscription returns `version`. Schemas with
+    /// `extra_field` also expose an `extra` query field.
+    fn versioned_schema(version: i32, extra_field: bool) -> Schema {
+        let mut query = Object::new("Query").field(Field::new(
+            "version",
+            TypeRef::named_nn(TypeRef::INT),
+            move |_| FieldFuture::new(async move { Ok(Some(Value::from(version))) }),
+        ));
+        if extra_field {
+            query = query.field(Field::new(
+                "extra",
+                TypeRef::named_nn(TypeRef::STRING),
+                |_| FieldFuture::new(async { Ok(Some(Value::from("hello"))) }),
+            ));
+        }
+
+        let subscription = Subscription::new("Subscription").field(SubscriptionField::new(
+            "version",
+            TypeRef::named_nn(TypeRef::INT),
+            move |_| {
+                SubscriptionFieldFuture::new(async move {
+                    Ok(tokio_stream::iter([Ok(FieldValue::value(version))]))
+                })
+            },
+        ));
+
+        Schema::build("Query", None, Some("Subscription"))
+            .register(query)
+            .register(subscription)
+            .finish()
+            .unwrap()
+    }
+
+    async fn served_version(schema: &DynamicSchema) -> i64 {
+        let response = Executor::execute(schema, Request::new("{ version }")).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        response.data.into_json().unwrap()["version"]
+            .as_i64()
+            .unwrap()
+    }
+
+    async fn wait_for_version(schema: &DynamicSchema, expected: i64) {
+        tokio::time::timeout(WAIT_TIMEOUT, async {
+            while served_version(schema).await != expected {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("schema version {expected} was never served"));
+    }
+
+    /// Drives [`rebuild_schema_on_updates`] with an injected update stream and build function.
+    struct RebuildHarness {
+        schema: DynamicSchema,
+        updates_tx: mpsc::UnboundedSender<()>,
+        shutdown_tx: broadcast::Sender<()>,
+        attempts: Arc<AtomicUsize>,
+        attempts_rx: mpsc::UnboundedReceiver<usize>,
+        handle: JoinHandle<()>,
+    }
+
+    impl RebuildHarness {
+        /// Spawns the rebuild loop. Build attempt `n` (starting at 1) returns `outcome(n)`.
+        /// `pending_updates` are queued before the loop starts.
+        fn spawn(
+            quiet_period: Duration,
+            max_delay: Duration,
+            pending_updates: usize,
+            outcome: impl Fn(usize) -> Result<Schema> + Send + 'static,
+        ) -> Self {
+            let schema = DynamicSchema::new(versioned_schema(1, false));
+            let (updates_tx, updates_rx) = mpsc::unbounded_channel();
+            for _ in 0..pending_updates {
+                updates_tx.send(()).unwrap();
+            }
+            let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let (attempts_tx, attempts_rx) = mpsc::unbounded_channel();
+
+            let build = {
+                let attempts = attempts.clone();
+                move || {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                    let result = outcome(attempt);
+                    attempts_tx.send(attempt).unwrap();
+                    async move { result }
+                }
+            };
+
+            let handle = tokio::spawn(rebuild_schema_on_updates(
+                schema.clone(),
+                UnboundedReceiverStream::new(updates_rx),
+                shutdown_rx,
+                quiet_period,
+                max_delay,
+                build,
+            ));
+
+            Self {
+                schema,
+                updates_tx,
+                shutdown_tx,
+                attempts,
+                attempts_rx,
+                handle,
+            }
+        }
+
+        async fn next_attempt(&mut self) -> usize {
+            tokio::time::timeout(WAIT_TIMEOUT, self.attempts_rx.recv())
+                .await
+                .expect("timed out waiting for a schema rebuild")
+                .unwrap()
+        }
+
+        fn attempts(&self) -> usize {
+            self.attempts.load(Ordering::SeqCst)
+        }
+
+        async fn shutdown(self) {
+            self.shutdown_tx.send(()).unwrap();
+            tokio::time::timeout(WAIT_TIMEOUT, self.handle)
+                .await
+                .expect("rebuild loop did not stop on shutdown")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_swapped_schema_is_served_without_rebinding() {
+        let schema = DynamicSchema::new(versioned_schema(1, false));
+        // The filter (i.e. the server) is created once, only the schema behind it changes.
+        let filter = graphql_filter(schema.clone());
+
+        let query = |filter| async move {
+            let response = warp::test::request()
+                .method("POST")
+                .header("content-type", "application/json")
+                .body(r#"{"query":"{ version extra }"}"#)
+                .reply(filter)
+                .await;
+            serde_json::from_slice::<serde_json::Value>(response.body()).unwrap()
+        };
+
+        let response = query(&filter).await;
+        assert!(
+            response["errors"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("extra"),
+            "unexpected response: {response}"
+        );
+
+        schema.swap(versioned_schema(2, true));
+
+        let response = query(&filter).await;
+        assert!(response.get("errors").is_none(), "{response}");
+        assert_eq!(response["data"]["version"], 2);
+        assert_eq!(response["data"]["extra"], "hello");
+    }
+
+    #[tokio::test]
+    async fn test_running_subscriptions_keep_their_schema() {
+        let schema = DynamicSchema::new(versioned_schema(1, false));
+
+        let mut running =
+            Executor::execute_stream(&schema, Request::new("subscription { version }"), None);
+        schema.swap(versioned_schema(2, false));
+        let mut started_after_swap =
+            Executor::execute_stream(&schema, Request::new("subscription { version }"), None);
+
+        let running = running.next().await.unwrap().into_result().unwrap();
+        assert_eq!(running.data.into_json().unwrap()["version"], 1);
+        let started_after_swap = started_after_swap
+            .next()
+            .await
+            .unwrap()
+            .into_result()
+            .unwrap();
+        assert_eq!(started_after_swap.data.into_json().unwrap()["version"], 2);
+    }
+
+    #[tokio::test]
+    async fn test_failed_rebuild_keeps_previous_schema() {
+        let mut harness = RebuildHarness::spawn(
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+            0,
+            |attempt| match attempt {
+                1 => Err(anyhow::anyhow!("pool timed out")),
+                _ => Ok(versioned_schema(2, false)),
+            },
+        );
+
+        harness.updates_tx.send(()).unwrap();
+        assert_eq!(harness.next_attempt().await, 1);
+        assert_eq!(served_version(&harness.schema).await, 1);
+
+        // The loop survives the failure and applies the next successful rebuild.
+        harness.updates_tx.send(()).unwrap();
+        assert_eq!(harness.next_attempt().await, 2);
+        wait_for_version(&harness.schema, 2).await;
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_burst_of_updates_triggers_single_rebuild() {
+        let quiet_period = Duration::from_millis(200);
+        let mut harness =
+            RebuildHarness::spawn(quiet_period, Duration::from_secs(30), 50, |attempt| {
+                Ok(versioned_schema(attempt as i32 + 1, false))
+            });
+
+        assert_eq!(harness.next_attempt().await, 1);
+        wait_for_version(&harness.schema, 2).await;
+
+        tokio::time::sleep(quiet_period * 3).await;
+        assert_eq!(harness.attempts(), 1);
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_trickle_of_updates_is_debounced() {
+        let quiet_period = Duration::from_millis(300);
+        let mut harness =
+            RebuildHarness::spawn(quiet_period, Duration::from_secs(30), 0, |attempt| {
+                Ok(versioned_schema(attempt as i32 + 1, false))
+            });
+
+        for _ in 0..20 {
+            harness.updates_tx.send(()).unwrap();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        harness.next_attempt().await;
+        tokio::time::sleep(quiet_period * 3).await;
+        // Ideally exactly one, allow a second one in case the test runner stalls mid-trickle.
+        assert!(
+            harness.attempts() <= 2,
+            "20 updates caused {} rebuilds",
+            harness.attempts()
+        );
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_continuous_updates_do_not_postpone_rebuild_forever() {
+        // The quiet period is never reached, only `max_delay` can trigger the rebuild.
+        let harness = RebuildHarness::spawn(
+            Duration::from_secs(60),
+            Duration::from_millis(200),
+            0,
+            |attempt| Ok(versioned_schema(attempt as i32 + 1, false)),
+        );
+
+        tokio::time::timeout(WAIT_TIMEOUT, async {
+            loop {
+                harness.updates_tx.send(()).unwrap();
+                if harness.attempts() > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("rebuild was postponed while updates kept coming");
+        wait_for_version(&harness.schema, 2).await;
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_rebuild_loop_stops_when_updates_end() {
+        let harness =
+            RebuildHarness::spawn(Duration::from_millis(20), Duration::from_secs(5), 0, |_| {
+                Ok(versioned_schema(2, false))
+            });
+
+        drop(harness.updates_tx);
+        tokio::time::timeout(WAIT_TIMEOUT, harness.handle)
+            .await
+            .expect("rebuild loop did not stop when the update stream ended")
+            .unwrap();
+        assert_eq!(harness.attempts.load(Ordering::SeqCst), 0);
+    }
+
+    /// Sends a GraphQL query to `addr` over plain HTTP/1.1 and returns the JSON response body.
+    async fn http_query(addr: SocketAddr, query: &str) -> serde_json::Value {
+        let body = serde_json::json!({ "query": query }).to_string();
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                format!(
+                    "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {response}"))
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[serial]
+    async fn test_server_picks_up_registered_model_on_same_address(pool: SqlitePool) {
+        let (db, provider, _executor_shutdown) = setup_sql(&pool).await;
+        let messaging = Arc::new(Messaging::new(
+            Default::default(),
+            Arc::new(db.clone()),
+            provider,
+        ));
+        let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
+
+        let (addr, server) = server::new(shutdown_rx, &pool, messaging, Arc::new(db.clone()))
+            .await
+            .unwrap();
+        let server = tokio::spawn(server);
+
+        let type_query = format!(
+            r#"{{ __type(name: "{}") {{ name }} }}"#,
+            utils::type_name_from_names("types_test", "Record")
+        );
+        assert!(http_query(addr, &type_query).await["data"]["__type"].is_null());
+
+        // Registering a model publishes a model update, which rebuilds the schema in place.
+        model_fixtures(&db).await;
+        tokio::time::timeout(WAIT_TIMEOUT, async {
+            while http_query(addr, &type_query).await["data"]["__type"].is_null() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("registered model never showed up in the served schema");
+
+        shutdown_tx.send(()).unwrap();
+        tokio::time::timeout(WAIT_TIMEOUT, server)
+            .await
+            .expect("server did not stop on shutdown")
+            .unwrap();
     }
 }
