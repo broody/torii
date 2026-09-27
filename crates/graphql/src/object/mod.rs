@@ -94,7 +94,7 @@ pub trait BasicObject: Send + Sync {
                                     values
                                         .edges
                                         .iter()
-                                        .map(FieldValue::borrowed_any)
+                                        .map(|edge| FieldValue::borrowed_any(edge))
                                         .collect::<Vec<FieldValue<'_>>>(),
                                 )));
                             }
@@ -135,7 +135,7 @@ pub trait BasicObject: Send + Sync {
                                     values
                                         .edges
                                         .iter()
-                                        .map(FieldValue::borrowed_any)
+                                        .map(|edge| FieldValue::borrowed_any(edge))
                                         .collect::<Vec<FieldValue<'_>>>(),
                                 )));
                             }

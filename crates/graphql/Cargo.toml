@@ -10,7 +10,7 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-async-graphql = { version = "7.0.11", features = [ "chrono", "dataloader", "dynamic-schema" ] }
+async-graphql = { version = "7.2.1", features = [ "chrono", "dataloader", "dynamic-schema" ] }
 async-recursion = "1.0.5"
 base64.workspace = true
 chrono.workspace = true

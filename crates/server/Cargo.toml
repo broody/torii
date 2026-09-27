@@ -9,7 +9,7 @@ version.workspace = true
 torii-mcp = { path = "../mcp" }
 
 anyhow.workspace = true
-async-graphql = "7.0.11"
+async-graphql = "7.2.1"
 base64.workspace = true
 camino.workspace = true
 chrono.workspace = true
@@ -58,4 +58,4 @@ rustls-pemfile = "1.0.4"
 hostname = "0.4"
 
 [dev-dependencies]
-async-graphql = { version = "7.0.11", features = ["dynamic-schema"] }
+async-graphql = { version = "7.2.1", features = ["dynamic-schema"] }
