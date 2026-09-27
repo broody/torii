@@ -12,6 +12,8 @@ pub mod model_data;
 pub mod publish_message;
 pub mod transaction;
 
+use std::str::FromStr;
+
 use async_graphql::dynamic::{
     Enum, Field, FieldFuture, FieldValue, InputObject, InputValue, Object, SubscriptionField,
     TypeRef,
@@ -22,6 +24,8 @@ use erc::erc_token::ErcTokenType;
 use erc::token_transfer::TokenTransferNode;
 use erc::{Connection, ConnectionEdge};
 use sqlx::{Pool, Sqlite};
+use starknet_crypto::Felt;
+use torii_sqlite::utils::felt_to_sql_string;
 
 use self::connection::edge::EdgeObject;
 use self::connection::{
@@ -254,6 +258,33 @@ pub fn resolve_one(
     type_name: &str,
     type_mapping: &TypeMapping,
 ) -> Field {
+    resolve_one_with_id(
+        table_name,
+        id_column,
+        field_name,
+        type_name,
+        type_mapping,
+        |id| Ok(id.to_owned()),
+    )
+}
+
+/// Normalizes a felt id argument to the padded format felts are stored in, so that any spelling
+/// of it (unpadded, upper case) matches.
+pub fn felt_id(id: &str) -> async_graphql::Result<String> {
+    let felt =
+        Felt::from_str(id).map_err(|_| async_graphql::Error::new(format!("Invalid felt: {id}")))?;
+    Ok(felt_to_sql_string(&felt))
+}
+
+/// Like [`resolve_one`], with the id argument mapped by `normalize_id` before it is looked up.
+pub fn resolve_one_with_id(
+    table_name: &str,
+    id_column: &str,
+    field_name: &str,
+    type_name: &str,
+    type_mapping: &TypeMapping,
+    normalize_id: fn(&str) -> async_graphql::Result<String>,
+) -> Field {
     let type_mapping = type_mapping.clone();
     let table_name = table_name.to_owned();
     let id_column = id_column.to_owned();
@@ -271,6 +302,7 @@ pub fn resolve_one(
             let mut conn = ctx.data::<Pool<Sqlite>>()?.acquire().await?;
             let id: String =
                 extract::<String>(ctx.args.as_index_map(), &id_column.to_case(Case::Camel))?;
+            let id = normalize_id(&id)?;
             let data = fetch_single_row(&mut conn, &table_name, &id_column, &id).await?;
             let model = value_mapping_from_row(&data, &type_mapping, false, true)?;
             Ok(Some(Value::Object(model)))

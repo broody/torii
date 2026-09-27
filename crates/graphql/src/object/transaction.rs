@@ -24,7 +24,7 @@ use crate::object::erc::token_transfer::{
     mappable_transfer_condition, token_transfer_mapping_from_row, transfers_from,
     TransferQueryResultRaw, TRANSFER_COLUMNS,
 };
-use crate::object::{resolve_many, resolve_one};
+use crate::object::{felt_id, resolve_many, resolve_one_with_id};
 use crate::query::value_mapping_from_row;
 use crate::utils;
 
@@ -71,12 +71,13 @@ impl BasicObject for TransactionObject {
 
 impl ResolvableObject for TransactionObject {
     fn resolvers(&self) -> Vec<Field> {
-        let resolve_one = resolve_one(
+        let resolve_one = resolve_one_with_id(
             TRANSACTION_TABLE,
             TRANSACTION_HASH_COLUMN,
             self.name().0,
             self.type_name(),
             self.type_mapping(),
+            felt_id,
         );
 
         let resolve_many = resolve_many(
@@ -235,11 +236,7 @@ impl TransactionObject {
 /// Returns the hash of the parent transaction in the format it is stored in: the transaction
 /// queries strip leading zeros from felts.
 fn parent_transaction_hash(indexmap: &ValueMapping) -> async_graphql::Result<String> {
-    let transaction_hash = utils::extract::<String>(indexmap, "transactionHash")?;
-    let transaction_hash = Felt::from_str(&transaction_hash).map_err(|_| {
-        async_graphql::Error::new(format!("Invalid transaction hash: {transaction_hash}"))
-    })?;
-    Ok(felt_to_sql_string(&transaction_hash))
+    felt_id(&utils::extract::<String>(indexmap, "transactionHash")?)
 }
 
 // NOTE: `calls` and `tokenTransfers` run one query per transaction. Batching them across the

@@ -58,6 +58,28 @@ mod tests {
     }
 
     #[sqlx::test(migrations = "../migrations")]
+    async fn test_transaction_lookup_accepts_any_hash_spelling(pool: SqlitePool) {
+        let schema = schema(&pool).await;
+        insert_transaction(&pool, TRANSACTION_HASH).await;
+
+        // stored padded, looked up unpadded or padded to any width
+        let padded = felt_to_sql_string(&TRANSACTION_HASH);
+        for hash in ["0x123", "0x0000123", padded.as_str()] {
+            let result = run_graphql_query(
+                &schema,
+                &format!(r#"{{ transaction(transactionHash: "{hash}") {{ transactionHash }} }}"#),
+            )
+            .await;
+            assert_eq!(result["transaction"]["transactionHash"], "0x123", "{hash}");
+        }
+
+        let response = schema
+            .execute(r#"{ transaction(transactionHash: "not a felt") { transactionHash } }"#)
+            .await;
+        assert_eq!(response.errors[0].message, "Invalid felt: not a felt");
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
     async fn test_transaction_calls_and_token_transfers(pool: SqlitePool) {
         let schema = schema(&pool).await;
         insert_transaction(&pool, TRANSACTION_HASH).await;
