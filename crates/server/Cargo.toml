@@ -9,6 +9,7 @@ version.workspace = true
 torii-mcp = { path = "../mcp" }
 
 anyhow.workspace = true
+async-graphql = "7.0.11"
 base64.workspace = true
 camino.workspace = true
 chrono.workspace = true
@@ -24,13 +25,13 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
-tokio-util = "0.7.7"
+tokio-util = { version = "0.7.11", features = ["rt"] }
 tokio.workspace = true
+torii-graphql.workspace = true
 torii-sqlite.workspace = true
 tower-http = { workspace = true, features = ["cors"] }
 tower.workspace = true
 tracing.workspace = true
-warp.workspace = true
 form_urlencoded = "1.2.1"
 async-trait = "0.1.83"
 tokio-tungstenite = "0.20.0"
@@ -55,3 +56,6 @@ rustls-pemfile = "1.0.4"
 
 # Hostname support
 hostname = "0.4"
+
+[dev-dependencies]
+async-graphql = { version = "7.0.11", features = ["dynamic-schema"] }

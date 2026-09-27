@@ -20,8 +20,10 @@ use rustls::{Certificate, PrivateKey, ServerConfig};
 use serde_json::json;
 use sqlx::SqlitePool;
 use starknet::providers::Provider;
+use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use tokio_rustls::TlsAcceptor;
+use torii_graphql::server::DynamicSchema;
 use torii_storage::Storage;
 use tower::ServiceBuilder;
 use tower_http::cors::{AllowOrigin, CorsLayer};
@@ -111,34 +113,12 @@ pub fn create_grpc_proxy_client(
     ReverseProxy::new(client)
 }
 
-/// Create a WebSocket-compatible HTTP/1.1 proxy client
-pub fn create_websocket_proxy_client() -> ReverseProxy<HttpConnector<GaiResolver>> {
-    ReverseProxy::new(Client::builder().build_http())
-}
-
-// Helper function to check if a request is a WebSocket upgrade request
-pub fn is_websocket_upgrade(req: &Request<Body>) -> bool {
-    req.headers()
-        .get("upgrade")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.to_lowercase() == "websocket")
-        .unwrap_or(false)
-        && req
-            .headers()
-            .get("connection")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.to_lowercase().contains("upgrade"))
-            .unwrap_or(false)
-}
-
 pub struct Proxy<P: Provider + Sync + Send + Debug + 'static> {
     addr: SocketAddr,
     allowed_origins: Option<Vec<String>>,
     handlers: Arc<RwLock<Vec<Box<dyn Handler>>>>,
     version_spec: String,
     tls_config: Option<Arc<ServerConfig>>,
-    grpc_proxy_client: Arc<ReverseProxy<HttpConnector<GaiResolver>>>,
-    websocket_proxy_client: Arc<ReverseProxy<HttpConnector<GaiResolver>>>,
     hostname: Option<String>,
     _provider: std::marker::PhantomData<P>,
 }
@@ -165,7 +145,6 @@ impl<P: Provider + Sync + Send + Debug + 'static> Proxy<P> {
         addr: SocketAddr,
         allowed_origins: Option<Vec<String>>,
         grpc_addr: Option<SocketAddr>,
-        graphql_addr: Option<SocketAddr>,
         artifacts_dir: Utf8PathBuf,
         pool: Arc<SqlitePool>,
         raw_sql: bool,
@@ -176,15 +155,11 @@ impl<P: Provider + Sync + Send + Debug + 'static> Proxy<P> {
     ) -> Self {
         // Create proxy clients with configured settings
         let grpc_proxy_client = Arc::new(create_grpc_proxy_client(&proxy_settings));
-        let websocket_proxy_client = Arc::new(create_websocket_proxy_client());
 
         let handlers: Vec<Box<dyn Handler>> = vec![
-            Box::new(GraphQLHandler::new(
-                graphql_addr,
-                grpc_proxy_client.clone(),
-                websocket_proxy_client.clone(),
-            )),
-            Box::new(GrpcHandler::new(grpc_addr, grpc_proxy_client.clone())),
+            // Serves GraphQL once the schema is set with `set_graphql_schema`.
+            Box::new(GraphQLHandler::new(None, None)),
+            Box::new(GrpcHandler::new(grpc_addr, grpc_proxy_client)),
             Box::new(McpHandler::new(pool.clone())),
             Box::new(MetadataHandler::new(storage.clone(), provider)),
             Box::new(SqlHandler::new(pool.clone(), raw_sql)),
@@ -202,8 +177,6 @@ impl<P: Provider + Sync + Send + Debug + 'static> Proxy<P> {
             handlers,
             version_spec,
             tls_config: None,
-            grpc_proxy_client,
-            websocket_proxy_client,
             hostname,
             _provider: std::marker::PhantomData,
         }
@@ -253,13 +226,11 @@ impl<P: Provider + Sync + Send + Debug + 'static> Proxy<P> {
         Ok(server_config)
     }
 
-    pub async fn set_graphql_addr(&self, addr: SocketAddr) {
+    /// Serves GraphQL requests with `schema`. Its operations are executed on `runtime`, or on the
+    /// proxy's runtime if `None`.
+    pub async fn set_graphql_schema(&self, schema: DynamicSchema, runtime: Option<Handle>) {
         let mut handlers = self.handlers.write().await;
-        handlers[0] = Box::new(GraphQLHandler::new(
-            Some(addr),
-            self.grpc_proxy_client.clone(),
-            self.websocket_proxy_client.clone(),
-        ));
+        handlers[0] = Box::new(GraphQLHandler::new(Some(schema), runtime));
     }
 
     fn create_cors_layer(&self) -> Option<CorsLayer> {

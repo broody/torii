@@ -1,6 +1,5 @@
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -16,8 +15,6 @@ mod tests {
     use starknet::providers::jsonrpc::HttpTransport;
     use starknet::providers::JsonRpcClient;
     use starknet_crypto::Felt;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpStream;
     use tokio::sync::{broadcast, mpsc};
     use tokio::task::JoinHandle;
     use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -29,7 +26,7 @@ mod tests {
     use url::Url;
 
     use crate::schema::build_schema;
-    use crate::server::{self, graphql_filter, rebuild_schema_on_updates, DynamicSchema};
+    use crate::server::{self, rebuild_schema_on_updates, DynamicSchema};
     use crate::tests::model_fixtures;
     use crate::utils;
 
@@ -415,22 +412,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_swapped_schema_is_served_without_rebinding() {
+    async fn test_swapped_schema_is_served_by_existing_handle() {
         let schema = DynamicSchema::new(versioned_schema(1, false));
-        // The filter (i.e. the server) is created once, only the schema behind it changes.
-        let filter = graphql_filter(schema.clone());
+        // Handles are created once (e.g. by the HTTP handler), only the schema behind them changes.
+        let handle = schema.clone();
 
-        let query = |filter| async move {
-            let response = warp::test::request()
-                .method("POST")
-                .header("content-type", "application/json")
-                .body(r#"{"query":"{ version extra }"}"#)
-                .reply(filter)
-                .await;
-            serde_json::from_slice::<serde_json::Value>(response.body()).unwrap()
+        let query = |schema: DynamicSchema| async move {
+            let response = Executor::execute(&schema, Request::new("{ version extra }")).await;
+            serde_json::to_value(&response).unwrap()
         };
 
-        let response = query(&filter).await;
+        let response = query(handle.clone()).await;
         assert!(
             response["errors"][0]["message"]
                 .as_str()
@@ -441,7 +433,7 @@ mod tests {
 
         schema.swap(versioned_schema(2, true));
 
-        let response = query(&filter).await;
+        let response = query(handle).await;
         assert!(response.get("errors").is_none(), "{response}");
         assert_eq!(response["data"]["version"], 2);
         assert_eq!(response["data"]["extra"], "hello");
@@ -561,44 +553,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rebuild_loop_stops_when_updates_end() {
-        let harness =
+    async fn test_rebuild_loop_waits_for_shutdown_when_updates_end() {
+        let mut harness =
             RebuildHarness::spawn(Duration::from_millis(20), Duration::from_secs(5), 0, |_| {
                 Ok(versioned_schema(2, false))
             });
 
-        drop(harness.updates_tx);
-        tokio::time::timeout(WAIT_TIMEOUT, harness.handle)
-            .await
-            .expect("rebuild loop did not stop when the update stream ended")
-            .unwrap();
-        assert_eq!(harness.attempts.load(Ordering::SeqCst), 0);
-    }
+        // The runner shuts Torii down as soon as the GraphQL task resolves, so the loop must keep
+        // running (serving the last schema) once the update stream ends.
+        let (updates_tx, _) = mpsc::unbounded_channel();
+        drop(std::mem::replace(&mut harness.updates_tx, updates_tx));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!harness.handle.is_finished());
+        assert_eq!(harness.attempts(), 0);
+        assert_eq!(served_version(&harness.schema).await, 1);
 
-    /// Sends a GraphQL query to `addr` over plain HTTP/1.1 and returns the JSON response body.
-    async fn http_query(addr: SocketAddr, query: &str) -> serde_json::Value {
-        let body = serde_json::json!({ "query": query }).to_string();
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-        stream
-            .write_all(
-                format!(
-                    "POST / HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .as_bytes(),
-            )
-            .await
-            .unwrap();
-        let mut response = String::new();
-        stream.read_to_string(&mut response).await.unwrap();
-        let (_, body) = response.split_once("\r\n\r\n").unwrap();
-        serde_json::from_str(body).unwrap_or_else(|e| panic!("{e}: {response}"))
+        harness.shutdown().await;
     }
 
     #[sqlx::test(migrations = "../migrations")]
     #[serial]
-    async fn test_server_picks_up_registered_model_on_same_address(pool: SqlitePool) {
+    async fn test_built_schema_picks_up_registered_model(pool: SqlitePool) {
         let (db, provider, _executor_shutdown) = setup_sql(&pool).await;
         let messaging = Arc::new(Messaging::new(
             Default::default(),
@@ -607,31 +582,40 @@ mod tests {
         ));
         let (shutdown_tx, shutdown_rx) = broadcast::channel(1);
 
-        let (addr, server) = server::new(shutdown_rx, &pool, messaging, Arc::new(db.clone()))
+        let (schema, rebuild) = server::build(shutdown_rx, &pool, messaging, Arc::new(db.clone()))
             .await
             .unwrap();
-        let server = tokio::spawn(server);
+        let rebuild = tokio::spawn(rebuild);
 
         let type_query = format!(
             r#"{{ __type(name: "{}") {{ name }} }}"#,
             utils::type_name_from_names("types_test", "Record")
         );
-        assert!(http_query(addr, &type_query).await["data"]["__type"].is_null());
+        let type_is_null = |schema: DynamicSchema| {
+            let request = Request::new(type_query.clone());
+            async move {
+                let response = Executor::execute(&schema, request).await;
+                assert!(response.errors.is_empty(), "{:?}", response.errors);
+                response.data.into_json().unwrap()["__type"].is_null()
+            }
+        };
+        assert!(type_is_null(schema.clone()).await);
 
         // Registering a model publishes a model update, which rebuilds the schema in place.
         model_fixtures(&db).await;
         tokio::time::timeout(WAIT_TIMEOUT, async {
-            while http_query(addr, &type_query).await["data"]["__type"].is_null() {
+            while type_is_null(schema.clone()).await {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         })
         .await
-        .expect("registered model never showed up in the served schema");
+        .expect("registered model never showed up in the built schema");
 
+        assert!(!rebuild.is_finished());
         shutdown_tx.send(()).unwrap();
-        tokio::time::timeout(WAIT_TIMEOUT, server)
+        tokio::time::timeout(WAIT_TIMEOUT, rebuild)
             .await
-            .expect("server did not stop on shutdown")
+            .expect("rebuild loop did not stop on shutdown")
             .unwrap();
     }
 }

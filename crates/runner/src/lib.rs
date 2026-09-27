@@ -763,7 +763,6 @@ impl Runner {
                 .http_cors_origins
                 .filter(|cors_origins| !cors_origins.is_empty()),
             Some(grpc_addr),
-            None,
             absolute_path.clone(),
             Arc::new(readonly_pool.clone()),
             self.args.server.raw_sql,
@@ -933,8 +932,8 @@ impl Runner {
     }
 }
 
-/// Runs the GraphQL server until shutdown. The server hot-swaps its schema when models are
-/// registered or upgraded, so its address is only registered with the proxy once.
+/// Serves GraphQL through the proxy until shutdown. The schema is hot-swapped when models are
+/// registered or upgraded, so it is only handed to the proxy once.
 async fn run_graphql_server<P: Provider + Sync + Send + Clone + Debug + 'static>(
     shutdown_rx: broadcast::Receiver<()>,
     pool: Arc<SqlitePool>,
@@ -943,13 +942,18 @@ async fn run_graphql_server<P: Provider + Sync + Send + Clone + Debug + 'static>
     storage: Arc<dyn ReadOnlyStorage>,
 ) -> anyhow::Result<()> {
     // Flatten the cause chain into the message: `handle_task!` only keeps the error's `Display`.
-    let (addr, server) = torii_graphql::server::new(shutdown_rx, &pool, messaging, storage)
+    let (schema, rebuild) = torii_graphql::server::build(shutdown_rx, &pool, messaging, storage)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to start GraphQL server: {e:#}"))?;
 
-    proxy_server.set_graphql_addr(addr).await;
+    // This task runs on the query runtime: execute GraphQL operations there too, rather than on
+    // the proxy's runtime.
+    proxy_server
+        .set_graphql_schema(schema, Some(tokio::runtime::Handle::current()))
+        .await;
 
-    server.await;
+    // Only resolves on shutdown.
+    rebuild.await;
     Ok(())
 }
 
