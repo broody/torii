@@ -147,7 +147,6 @@ mime_guess = "2.0"
 
 # server
 hyper = "0.14.27"
-warp = "0.3"
 
 # gRPC
 prost = "0.12"

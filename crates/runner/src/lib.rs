@@ -897,7 +897,7 @@ impl Runner {
             ($result:expr, $name:literal) => {
                 match $result {
                     Ok(Ok(())) => Ok(()),
-                    Ok(Err(e)) => Err(anyhow::anyhow!("{} failed: {}", $name, e)),
+                    Ok(Err(e)) => Err(anyhow::anyhow!("{} failed: {:#}", $name, e)),
                     Err(e) => Err(anyhow::anyhow!("{} task panicked: {}", $name, e)),
                 }
             };
@@ -941,10 +941,9 @@ async fn run_graphql_server<P: Provider + Sync + Send + Clone + Debug + 'static>
     messaging: Arc<Messaging<P>>,
     storage: Arc<dyn ReadOnlyStorage>,
 ) -> anyhow::Result<()> {
-    // Flatten the cause chain into the message: `handle_task!` only keeps the error's `Display`.
     let (schema, rebuild) = torii_graphql::server::build(shutdown_rx, &pool, messaging, storage)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to start GraphQL server: {e:#}"))?;
+        .map_err(|e| e.context("Failed to start GraphQL server"))?;
 
     // This task runs on the query runtime: execute GraphQL operations there too, rather than on
     // the proxy's runtime.

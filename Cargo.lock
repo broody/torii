@@ -9351,7 +9351,6 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "toml 0.8.19",
- "torii-broker",
  "torii-cache",
  "torii-cli",
  "torii-controllers",
