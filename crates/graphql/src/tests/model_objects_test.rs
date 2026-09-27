@@ -6,7 +6,7 @@ mod tests {
     use async_graphql::{Name, Value};
     use dojo_types::naming::get_tag;
     use dojo_types::primitive::Primitive;
-    use dojo_types::schema::{Member, Struct, Ty};
+    use dojo_types::schema::{Enum, EnumOption, Member, Struct, Ty};
     use dojo_world::contracts::abigen::model::Layout;
     use dojo_world::contracts::naming::compute_selector_from_tag;
     use serde_json::json;
@@ -26,6 +26,7 @@ mod tests {
 
     use crate::constants::INTERNAL_ENTITY_ID_KEY;
     use crate::object::model_data::object;
+    use crate::query::build_type_mapping;
     use crate::schema::build_schema;
     use crate::tests::run_graphql_query;
     use crate::types::{TypeData, TypeMapping, ValueMapping};
@@ -367,5 +368,77 @@ mod tests {
             run_graphql_query(&schema_after, &query("... on ns_Position { vec { x y } }")).await;
         assert_eq!(models(&result, "entity"), expected(7, 3, 4));
         assert_eq!(models(&result, "eventMessage"), expected(9, 5, 6));
+    }
+
+    #[test]
+    fn test_build_type_mapping_of_non_struct_schema() {
+        let schemas = [
+            Ty::Primitive(Primitive::U32(None)),
+            Ty::Enum(Enum {
+                name: "ns-Direction".to_string(),
+                option: None,
+                options: vec![EnumOption {
+                    name: "Up".to_string(),
+                    ty: Ty::Tuple(vec![]),
+                }],
+            }),
+            Ty::Tuple(vec![Ty::Primitive(Primitive::U8(None))]),
+        ];
+        for schema in schemas {
+            assert!(build_type_mapping("ns", &schema).is_empty());
+        }
+        assert_eq!(
+            build_type_mapping("ns", &player_stats(Felt::ZERO, None))
+                .keys()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>(),
+            ["player", "score"]
+        );
+    }
+
+    // Models whose schema isn't a struct can't be exposed and are skipped when building the
+    // schema, which must stay valid even if no model is left for `ModelUnion`.
+    #[sqlx::test(migrations = "../migrations")]
+    #[serial]
+    async fn test_schema_skips_non_struct_models(pool: SqlitePool) {
+        let (db, _shutdown_tx) = setup_db(&pool).await;
+        let insert_model = |tag: &str, schema: &Ty| {
+            let (namespace, name) = tag.split_once('-').unwrap();
+            let selector = compute_selector_from_tag(tag);
+            sqlx::query(
+                "INSERT INTO models (id, model_selector, namespace, name, class_hash, layout, \
+                 schema, packed_size, unpacked_size, executed_at) VALUES (?, ?, ?, ?, '0x0', \
+                 '[]', ?, 0, 0, '2024-03-18T09:34:38Z')",
+            )
+            .bind(format_world_scoped_id(&Felt::ZERO, &selector))
+            .bind(format!("{selector:#064x}"))
+            .bind(namespace.to_string())
+            .bind(name.to_string())
+            .bind(serde_json::to_string(schema).unwrap())
+            .execute(&pool)
+        };
+        let possible_types = |schema: Schema| async move {
+            let result = run_graphql_query(
+                &schema,
+                r#"{ __type(name: "ModelUnion") { possibleTypes { name } } }"#,
+            )
+            .await;
+            result["__type"]["possibleTypes"].clone()
+        };
+
+        insert_model("ns-Counter", &Ty::Primitive(Primitive::U32(None)))
+            .await
+            .unwrap();
+        assert_eq!(
+            possible_types(schema(&db).await).await,
+            json!([{ "name": "World__Empty" }])
+        );
+
+        register_model(&db, &player_stats(Felt::ZERO, None)).await;
+        db.execute().await.unwrap();
+        assert_eq!(
+            possible_types(schema(&db).await).await,
+            json!([{ "name": "ns_Player_Stats" }])
+        );
     }
 }

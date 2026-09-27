@@ -12,6 +12,7 @@ use regex::Regex;
 use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 use torii_sqlite::constants::SQL_FELT_DELIMITER;
+use tracing::warn;
 
 use crate::constants::{
     BOOLEAN_TRUE, ENTITY_ID_COLUMN, EVENT_MESSAGE_ID_COLUMN, INTERNAL_ENTITY_ID_KEY,
@@ -29,8 +30,19 @@ pub mod order;
 static NESTED_TYPE_NAME_SANITIZER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"[, ()<>\[\];-]").unwrap());
 
+/// Builds the type mapping of a model from its schema.
+///
+/// Model schemas are expected to be structs. Any other schema yields an empty mapping, which
+/// callers treat as a model that can't be exposed through GraphQL.
 pub fn build_type_mapping(namespace: &str, schema: &Ty) -> TypeMapping {
-    let model = schema.as_struct().unwrap();
+    let Some(model) = schema.as_struct() else {
+        warn!(
+            namespace,
+            schema = %schema.name(),
+            "Model schema is not a struct, it won't be exposed through GraphQL."
+        );
+        return TypeMapping::new();
+    };
 
     model
         .children

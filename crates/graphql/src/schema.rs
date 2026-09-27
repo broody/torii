@@ -199,7 +199,6 @@ async fn build_objects(
     let mut model_registry = ModelRegistry::default();
 
     // model data objects
-    let mut has_model_types = false;
     for model in &models {
         // A single model with a malformed schema must not take down the whole GraphQL schema.
         let schema: Ty = match serde_json::from_str(&model.schema) {
@@ -223,7 +222,6 @@ async fn build_objects(
             let type_name = utils::type_name_from_names(&model.namespace, &model.name);
 
             model_union = model_union.possible_type(&type_name);
-            has_model_types = true;
 
             let table_name = get_tag(&model.namespace, &model.name);
             model_registry.insert(
@@ -247,7 +245,7 @@ async fn build_objects(
 
     // When creating an empty union, add the empty type (this is required otherwise the schema will
     // be invalid)
-    if !has_model_types {
+    if model_registry.is_empty() {
         model_union = model_union.possible_type(EMPTY_TYPE_NAME);
     }
 
