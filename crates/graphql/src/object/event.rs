@@ -3,7 +3,7 @@ use std::str::FromStr;
 use async_graphql::dynamic::{
     Field, InputValue, SubscriptionField, SubscriptionFieldFuture, TypeRef,
 };
-use async_graphql::{Name, Value};
+use async_graphql::{Error, Name, Value};
 use starknet_crypto::Felt;
 use tokio_stream::StreamExt;
 use torii_broker::types::{EventUpdate, InnerType};
@@ -53,7 +53,10 @@ impl ResolvableObject for EventObject {
             TypeRef::named_nn(self.type_name()),
             |ctx| {
                 SubscriptionFieldFuture::new(async move {
-                    let input_keys = parse_keys_argument(&ctx)?;
+                    // Parsed once per subscription rather than for every event.
+                    let input_keys = parse_keys_argument(&ctx)?
+                        .map(|keys| EventObject::parse_keys(&keys))
+                        .transpose()?;
                     Ok(
                         MemoryBroker::<EventUpdate>::subscribe().filter_map(move |event| {
                             EventObject::match_and_map_event(&input_keys, event)
@@ -93,8 +96,23 @@ impl EventObject {
         ])
     }
 
+    /// Parses subscription keys into felts, `None` standing for the `*` wildcard.
+    fn parse_keys(keys: &[String]) -> Result<Vec<Option<Felt>>, Error> {
+        keys.iter()
+            .map(|key| {
+                if key == "*" {
+                    Ok(None)
+                } else {
+                    Felt::from_str(key)
+                        .map(Some)
+                        .map_err(|e| Error::new(format!("Failed to parse key as felt: {e}")))
+                }
+            })
+            .collect()
+    }
+
     fn match_and_map_event(
-        input_keys: &Option<Vec<String>>,
+        input_keys: &Option<Vec<Option<Felt>>>,
         event: <EventUpdate as InnerType>::Inner,
     ) -> Option<ValueMapping> {
         if let Some(ref keys) = input_keys {
@@ -110,19 +128,57 @@ impl EventObject {
         }
     }
 
-    // Checks if the provided keys match the event's keys, allowing '*' as a wildcard. Returns true
+    // Checks if the provided keys match the event's keys, `None` being a wildcard. Returns true
     // if all keys match or if a wildcard is present at the respective position.
-    pub fn match_keys(input_keys: &[String], event: &<EventUpdate as InnerType>::Inner) -> bool {
+    pub fn match_keys(
+        input_keys: &[Option<Felt>],
+        event: &<EventUpdate as InnerType>::Inner,
+    ) -> bool {
         if input_keys.len() > event.event.keys.len() {
             return false;
         }
 
-        for (input_key, event_key) in input_keys.iter().zip(event.event.keys.iter()) {
-            if input_key != "*" && Felt::from_str(input_key).unwrap() != *event_key {
-                return false;
-            }
-        }
+        input_keys
+            .iter()
+            .zip(event.event.keys.iter())
+            .all(|(input_key, event_key)| input_key.is_none_or(|input_key| input_key == *event_key))
+    }
+}
 
-        true
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(keys: &[u64]) -> <EventUpdate as InnerType>::Inner {
+        let mut event = <EventUpdate as InnerType>::Inner::default();
+        event.event.keys = keys.iter().map(|key| Felt::from(*key)).collect();
+        event
+    }
+
+    fn keys(keys: &[&str]) -> Vec<Option<Felt>> {
+        let keys: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
+        EventObject::parse_keys(&keys).unwrap()
+    }
+
+    #[test]
+    fn match_keys_with_wildcards_and_prefixes() {
+        let event = event(&[0xdead, 0xbeef]);
+
+        assert!(EventObject::match_keys(&keys(&[]), &event));
+        assert!(EventObject::match_keys(&keys(&["0xdead"]), &event));
+        assert!(EventObject::match_keys(&keys(&["*", "0xbeef"]), &event));
+        // Keys are compared as felts, whatever their spelling.
+        assert!(EventObject::match_keys(
+            &keys(&["0x000000000000000000000000000000000000000000000000000000000000DEAD"]),
+            &event
+        ));
+
+        assert!(!EventObject::match_keys(&keys(&["0xbeef"]), &event));
+        assert!(!EventObject::match_keys(&keys(&["*", "*", "*"]), &event));
+    }
+
+    #[test]
+    fn parse_keys_rejects_invalid_felts() {
+        assert!(EventObject::parse_keys(&["0xnope".to_string()]).is_err());
     }
 }
