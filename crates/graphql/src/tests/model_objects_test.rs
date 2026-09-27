@@ -2,7 +2,8 @@
 mod tests {
     use std::sync::Arc;
 
-    use async_graphql::dynamic::Schema;
+    use async_graphql::dynamic::{Field, FieldFuture, FieldValue, Object, Schema, TypeRef, Union};
+    use async_graphql::{Name, Value};
     use dojo_types::naming::get_tag;
     use dojo_types::primitive::Primitive;
     use dojo_types::schema::{Member, Struct, Ty};
@@ -23,8 +24,11 @@ mod tests {
     use torii_storage::Storage;
     use url::Url;
 
+    use crate::constants::INTERNAL_ENTITY_ID_KEY;
+    use crate::object::model_data::object;
     use crate::schema::build_schema;
     use crate::tests::run_graphql_query;
+    use crate::types::{TypeData, TypeMapping, ValueMapping};
 
     const BLOCK_TIMESTAMP: u64 = 1710754478;
 
@@ -133,6 +137,92 @@ mod tests {
                 },
             ],
         })
+    }
+
+    // Nested values are built from the same row as their model, so nested fields must resolve from
+    // the parent value alone: no database access, and missing values resolve to null instead of
+    // panicking. Covers both parents: model values and owned `ModelUnion` members.
+    #[tokio::test]
+    async fn test_model_fields_resolve_from_parent_value() {
+        let nested_mapping = TypeMapping::from([
+            (
+                Name::new("x"),
+                TypeData::Simple(TypeRef::named(TypeRef::INT)),
+            ),
+            (
+                Name::new("y"),
+                TypeData::Simple(TypeRef::named(TypeRef::INT)),
+            ),
+        ]);
+        let mapping = TypeMapping::from([
+            (
+                Name::new("value"),
+                TypeData::Simple(TypeRef::named(TypeRef::INT)),
+            ),
+            (
+                Name::new("vec"),
+                TypeData::Nested((TypeRef::named("ns_Vec2"), nested_mapping.clone())),
+            ),
+            (
+                Name::new("missing"),
+                TypeData::Simple(TypeRef::named(TypeRef::INT)),
+            ),
+        ]);
+        let model_value = || {
+            ValueMapping::from([
+                (Name::new(INTERNAL_ENTITY_ID_KEY), Value::from("0x1")),
+                (Name::new("value"), Value::from(1)),
+                (
+                    Name::new("vec"),
+                    Value::Object(ValueMapping::from([
+                        (Name::new(INTERNAL_ENTITY_ID_KEY), Value::from("0x1")),
+                        (Name::new("x"), Value::from(2)),
+                        (Name::new("y"), Value::from(3)),
+                    ])),
+                ),
+            ])
+        };
+
+        let query = Object::new("Query")
+            .field(Field::new("model", TypeRef::named("ns_Model"), move |_| {
+                FieldFuture::new(async move { Ok(Some(Value::Object(model_value()))) })
+            }))
+            .field(Field::new(
+                "models",
+                TypeRef::named_list("ModelUnion"),
+                move |_| {
+                    FieldFuture::new(async move {
+                        Ok(Some(FieldValue::list([FieldValue::with_type(
+                            FieldValue::owned_any(model_value()),
+                            "ns_Model",
+                        )])))
+                    })
+                },
+            ));
+        // no pool registered: resolving model fields must not touch the database
+        let schema = Schema::build("Query", None, None)
+            .register(query)
+            .register(Union::new("ModelUnion").possible_type("ns_Model"))
+            .register(object("ns_Model", &mapping))
+            .register(object("ns_Vec2", &nested_mapping))
+            .finish()
+            .unwrap();
+
+        let result = schema
+            .execute(
+                r#"{
+                    model { value missing vec { x y } }
+                    models { ... on ns_Model { value missing vec { x y } } }
+                }"#,
+            )
+            .await;
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        let model = json!({ "value": 1, "missing": null, "vec": { "x": 2, "y": 3 } });
+        assert_eq!(
+            serde_json::to_value(result.data).unwrap(),
+            json!({ "model": model.clone(), "models": [model] })
+        );
     }
 
     // Model names may contain '_', so the model table can't be derived back from the GraphQL
