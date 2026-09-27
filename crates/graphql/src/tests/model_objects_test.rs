@@ -121,6 +121,45 @@ mod tests {
         format_world_scoped_id(&Felt::ZERO, &hashed_keys)
     }
 
+    /// Emits `model` as an event message, returns the event message id.
+    async fn set_event_message(db: &Sql, model: &Ty, event_id: &str) -> String {
+        let keys = keys(model);
+        let hashed_keys = poseidon_hash_many(&keys);
+        db.set_event_message(Felt::ZERO, model.clone(), event_id, BLOCK_TIMESTAMP, keys)
+            .await
+            .unwrap();
+        format_world_scoped_id(&Felt::ZERO, &hashed_keys)
+    }
+
+    fn position(player: Felt, vec: Option<(u32, u32)>) -> Ty {
+        let coordinate = |name: &str, value: Option<u32>| Member {
+            name: name.to_string(),
+            key: false,
+            ty: Ty::Primitive(Primitive::U32(value)),
+        };
+        Ty::Struct(Struct {
+            name: get_tag("ns", "Position"),
+            children: vec![
+                Member {
+                    name: "player".to_string(),
+                    key: true,
+                    ty: Ty::Primitive(Primitive::ContractAddress(Some(player))),
+                },
+                Member {
+                    name: "vec".to_string(),
+                    key: false,
+                    ty: Ty::Struct(Struct {
+                        name: "Vec2".to_string(),
+                        children: vec![
+                            coordinate("x", vec.map(|v| v.0)),
+                            coordinate("y", vec.map(|v| v.1)),
+                        ],
+                    }),
+                },
+            ],
+        })
+    }
+
     fn player_stats(player: Felt, score: Option<u32>) -> Ty {
         Ty::Struct(Struct {
             name: get_tag("ns", "Player_Stats"),
@@ -263,5 +302,70 @@ mod tests {
                 }
             })
         );
+    }
+
+    // The `models` union of entities and event messages resolves models from the registry built
+    // with the schema. Models registered after the schema was built aren't members of its
+    // `ModelUnion` and must be skipped rather than failing the query.
+    #[sqlx::test(migrations = "../migrations")]
+    #[serial]
+    async fn test_models_union_uses_schema_registry(pool: SqlitePool) {
+        let (db, _shutdown_tx) = setup_db(&pool).await;
+        register_model(&db, &player_stats(Felt::ZERO, None)).await;
+        let entity_id = set_entity(&db, &player_stats(Felt::ONE, Some(7)), "0x1:0x0:0x0").await;
+        let event_message_id =
+            set_event_message(&db, &player_stats(Felt::TWO, Some(9)), "0x2:0x0:0x0").await;
+        db.execute().await.unwrap();
+
+        let schema_before = schema(&db).await;
+
+        // registered after `schema_before` was built
+        register_model(&db, &position(Felt::ZERO, None)).await;
+        set_entity(&db, &position(Felt::ONE, Some((3, 4))), "0x3:0x0:0x0").await;
+        set_event_message(&db, &position(Felt::TWO, Some((5, 6))), "0x4:0x0:0x0").await;
+        db.execute().await.unwrap();
+
+        let schema_after = schema(&db).await;
+
+        // (dynamic schemas don't apply fragments conditioned on a union, hence no named fragment)
+        let query = |position_fields: &str| {
+            let models = format!(
+                "models {{ __typename ... on ns_Player_Stats {{ score }} {position_fields} }}"
+            );
+            format!(
+                r#"{{
+                    entity(id: "{entity_id}") {{ {models} }}
+                    eventMessage(id: "{event_message_id}") {{ {models} }}
+                }}"#
+            )
+        };
+        let models = |result: &serde_json::Value, parent: &str| {
+            result[parent]["models"].as_array().unwrap().clone()
+        };
+
+        // `ns_Position` isn't a type of `schema_before`
+        let result = run_graphql_query(&schema_before, &query("")).await;
+        let stats = |score| json!({ "__typename": "ns_Player_Stats", "score": score });
+        assert_eq!(models(&result, "entity"), vec![stats(7)]);
+        assert_eq!(models(&result, "eventMessage"), vec![stats(9)]);
+
+        // models are listed by model id
+        let mut tags = [get_tag("ns", "Player_Stats"), get_tag("ns", "Position")];
+        tags.sort_by_key(|tag| {
+            format_world_scoped_id(&Felt::ZERO, &compute_selector_from_tag(tag))
+        });
+        let expected = |score, x, y| {
+            tags.iter()
+                .map(|tag| match tag.as_str() {
+                    "ns-Player_Stats" => stats(score),
+                    _ => json!({ "__typename": "ns_Position", "vec": { "x": x, "y": y } }),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let result =
+            run_graphql_query(&schema_after, &query("... on ns_Position { vec { x y } }")).await;
+        assert_eq!(models(&result, "entity"), expected(7, 3, 4));
+        assert_eq!(models(&result, "eventMessage"), expected(9, 5, 6));
     }
 }

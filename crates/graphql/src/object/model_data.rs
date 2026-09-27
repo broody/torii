@@ -1,7 +1,11 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use async_graphql::dynamic::{Enum, Field, FieldFuture, FieldValue, InputObject, Object, TypeRef};
 use async_graphql::Value;
 use dojo_types::schema::Ty;
 use sqlx::{Pool, Sqlite};
+use tracing::debug;
 
 use super::connection::{connection_arguments, connection_output, parse_connection_arguments};
 use super::inputs::order_input::{order_argument, parse_order_argument, OrderInputObject};
@@ -9,8 +13,8 @@ use super::inputs::where_input::{parse_where_argument, where_argument, WhereInpu
 use super::inputs::InputObjectTrait;
 use super::{BasicObject, ResolvableObject, TypeMapping, ValueMapping};
 use crate::constants::{
-    ENTITY_TABLE, ENTITY_TYPE_NAME, EVENT_MESSAGE_TABLE, EVENT_MESSAGE_TYPE_NAME, ID_COLUMN,
-    INTERNAL_ENTITY_ID_KEY,
+    ENTITY_ID_COLUMN, ENTITY_TABLE, ENTITY_TYPE_NAME, EVENT_MESSAGE_ID_COLUMN, EVENT_MESSAGE_TABLE,
+    EVENT_MESSAGE_TYPE_NAME, ID_COLUMN, INTERNAL_ENTITY_ID_KEY,
 };
 use crate::mapping::ENTITY_TYPE_MAPPING;
 use crate::query::data::{count_rows, fetch_multiple_rows, fetch_single_row};
@@ -251,4 +255,116 @@ fn event_message_field() -> Field {
             })
         },
     )
+}
+
+/// A model exposed by the schema, as a member of `ModelUnion`.
+#[derive(Debug, Clone)]
+pub struct RegisteredModel {
+    /// GraphQL type name of the model (`{namespace}_{name}`).
+    pub type_name: String,
+    /// Model tag (`{namespace}-{name}`), which is also the name of the model table.
+    pub table_name: String,
+    pub type_mapping: TypeMapping,
+}
+
+/// Models the schema was built with, keyed by model id.
+///
+/// Registered as schema data so that resolving the models of an entity or event message doesn't
+/// have to load and parse model schemas on every request.
+#[derive(Debug, Default)]
+pub struct ModelRegistry {
+    models: HashMap<String, RegisteredModel>,
+}
+
+impl ModelRegistry {
+    pub fn insert(&mut self, model_id: String, model: RegisteredModel) {
+        self.models.insert(model_id, model);
+    }
+
+    pub fn get(&self, model_id: &str) -> Option<&RegisteredModel> {
+        self.models.get(model_id)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.models.is_empty()
+    }
+}
+
+/// Where the `models` union field finds the models of its parent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelUnionSource {
+    /// Models of an entity, through `entity_model`.
+    Entity,
+    /// Models of an event message, through `event_model`.
+    EventMessage,
+}
+
+impl ModelUnionSource {
+    /// Table relating the parent to its models.
+    fn relation_table(self) -> &'static str {
+        match self {
+            Self::Entity => "entity_model",
+            Self::EventMessage => "event_model",
+        }
+    }
+
+    /// Column of the model tables referencing the parent.
+    fn model_table_column(self) -> &'static str {
+        match self {
+            Self::Entity => ENTITY_ID_COLUMN,
+            Self::EventMessage => EVENT_MESSAGE_ID_COLUMN,
+        }
+    }
+}
+
+/// The `models` field of entities and event messages, resolving the parent's models as members of
+/// `ModelUnion`.
+pub fn model_union_field(source: ModelUnionSource) -> Field {
+    Field::new("models", TypeRef::named_list("ModelUnion"), move |ctx| {
+        FieldFuture::new(async move {
+            let Value::Object(indexmap) = ctx.parent_value.try_to_value()? else {
+                return Err("incorrect value, requires Value::Object".into());
+            };
+            let entity_id = utils::extract::<String>(indexmap, "id")?;
+            let registry = ctx.data::<Arc<ModelRegistry>>()?;
+            let mut conn = ctx.data::<Pool<Sqlite>>()?.acquire().await?;
+
+            // ordered by model id, as models were listed before the registry existed
+            let model_ids: Vec<String> = sqlx::query_scalar(&format!(
+                "SELECT model_id FROM {} WHERE entity_id = ? ORDER BY model_id",
+                source.relation_table()
+            ))
+            .bind(&entity_id)
+            .fetch_all(&mut *conn)
+            .await?;
+
+            let mut results: Vec<FieldValue<'_>> = Vec::with_capacity(model_ids.len());
+            for model_id in model_ids {
+                // Models registered after the schema was built aren't members of `ModelUnion`.
+                let Some(model) = registry.get(&model_id) else {
+                    debug!(%model_id, "Skipping model missing from the GraphQL schema.");
+                    continue;
+                };
+
+                let row = sqlx::query(&format!(
+                    "SELECT * FROM [{}] WHERE {} = ?",
+                    model.table_name,
+                    source.model_table_column()
+                ))
+                .bind(&entity_id)
+                .fetch_one(&mut *conn)
+                .await?;
+
+                // Use value_mapping_from_row to handle nested structures
+                let data = value_mapping_from_row(&row, &model.type_mapping, false, false)?;
+
+                results.push(FieldValue::with_type(
+                    FieldValue::owned_any(data),
+                    model.type_name.clone(),
+                ));
+            }
+
+            Ok(Some(FieldValue::list(results)))
+        })
+    })
 }

@@ -13,7 +13,7 @@ use tracing::warn;
 use super::object::connection::page_info::PageInfoObject;
 use super::object::entity::EntityObject;
 use super::object::event::EventObject;
-use super::object::model_data::ModelDataObject;
+use super::object::model_data::{ModelDataObject, ModelRegistry, RegisteredModel};
 use super::types::ScalarType;
 use super::utils;
 use crate::constants::{
@@ -57,7 +57,7 @@ pub async fn build_schema<P: Provider + Sync + Send + 'static>(
     storage: Arc<dyn ReadOnlyStorage>,
 ) -> Result<Schema> {
     // build world gql objects
-    let (objects, unions) = build_objects(pool).await?;
+    let (objects, unions, model_registry) = build_objects(pool).await?;
 
     let mut schema_builder = Schema::build(
         QUERY_TYPE_NAME,
@@ -148,11 +148,14 @@ pub async fn build_schema<P: Provider + Sync + Send + 'static>(
         .data(pool.clone())
         .data(messaging as Arc<dyn MessagingTrait>)
         .data(storage)
+        .data(Arc::new(model_registry))
         .finish()
         .map_err(|e| e.into())
 }
 
-async fn build_objects(pool: &SqlitePool) -> Result<(Vec<ObjectVariant>, Vec<Union>)> {
+async fn build_objects(
+    pool: &SqlitePool,
+) -> Result<(Vec<ObjectVariant>, Vec<Union>, ModelRegistry)> {
     let mut conn = pool.acquire().await?;
     let models: Vec<Model> = sqlx::query_as("SELECT * FROM models")
         .fetch_all(&mut *conn)
@@ -192,6 +195,9 @@ async fn build_objects(pool: &SqlitePool) -> Result<(Vec<ObjectVariant>, Vec<Uni
 
     unions.push(erc_token_union);
 
+    // models of the `ModelUnion`, resolved by entities and event messages
+    let mut model_registry = ModelRegistry::default();
+
     // model data objects
     let mut has_model_types = false;
     for model in &models {
@@ -219,10 +225,20 @@ async fn build_objects(pool: &SqlitePool) -> Result<(Vec<ObjectVariant>, Vec<Uni
             model_union = model_union.possible_type(&type_name);
             has_model_types = true;
 
+            let table_name = get_tag(&model.namespace, &model.name);
+            model_registry.insert(
+                model.id.clone(),
+                RegisteredModel {
+                    type_name: type_name.clone(),
+                    table_name: table_name.clone(),
+                    type_mapping: type_mapping.clone(),
+                },
+            );
+
             objects.push(ObjectVariant::Resolvable(Box::new(ModelDataObject::new(
                 field_name,
                 type_name,
-                get_tag(&model.namespace, &model.name),
+                table_name,
                 type_mapping.clone(),
                 schema,
             ))));
@@ -237,5 +253,5 @@ async fn build_objects(pool: &SqlitePool) -> Result<(Vec<ObjectVariant>, Vec<Uni
 
     unions.push(model_union);
 
-    Ok((objects, unions))
+    Ok((objects, unions, model_registry))
 }

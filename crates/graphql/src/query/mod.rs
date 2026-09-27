@@ -1,4 +1,5 @@
 use std::str::FromStr;
+use std::sync::LazyLock;
 
 use async_graphql::dynamic::indexmap::IndexMap;
 use async_graphql::dynamic::TypeRef;
@@ -20,6 +21,13 @@ use crate::types::{TypeData, TypeMapping, ValueMapping};
 pub mod data;
 pub mod filter;
 pub mod order;
+
+// Sanitizes nested type names into valid GraphQL names.
+// for eg. Position_Array<Vec2> -> Position_ArrayVec2
+// Position_(u8, Vec2) -> Position_u8Vec2
+// Position_[u8; 5] -> Position_u85
+static NESTED_TYPE_NAME_SANITIZER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"[, ()<>\[\];-]").unwrap());
 
 pub fn build_type_mapping(namespace: &str, schema: &Ty) -> TypeMapping {
     let model = schema.as_struct().unwrap();
@@ -112,12 +120,7 @@ fn parse_nested_type(namespace: &str, schema: &Ty) -> TypeData {
     };
 
     let name: String = format!("{}_{}", namespace, schema.name());
-    // sanitizes the member type string
-    // for eg. Position_Array<Vec2> -> Position_ArrayVec2
-    // Position_(u8, Vec2) -> Position_u8Vec2
-    // Position_[u8; 5] -> Position_u85
-    let re = Regex::new(r"[, ()<>\[\];-]").unwrap();
-    let sanitized_member_type_name = re.replace_all(&name, "");
+    let sanitized_member_type_name = NESTED_TYPE_NAME_SANITIZER.replace_all(&name, "");
     TypeData::Nested((TypeRef::named(sanitized_member_type_name), type_mapping))
 }
 

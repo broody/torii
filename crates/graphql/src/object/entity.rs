@@ -1,10 +1,8 @@
 use async_graphql::dynamic::indexmap::IndexMap;
 use async_graphql::dynamic::{
-    Field, FieldFuture, FieldValue, InputValue, SubscriptionField, SubscriptionFieldFuture, TypeRef,
+    Field, InputValue, SubscriptionField, SubscriptionFieldFuture, TypeRef,
 };
 use async_graphql::{Name, Value};
-use dojo_types::naming::get_tag;
-use dojo_types::schema::Ty;
 use sqlx::{Pool, Sqlite};
 use tokio_stream::StreamExt;
 use torii_broker::types::EntityUpdate;
@@ -14,14 +12,13 @@ use torii_sqlite::utils::felt_to_sql_string;
 use torii_storage::utils::format_world_scoped_id;
 
 use super::inputs::keys_input::keys_argument;
+use super::model_data::{model_union_field, ModelUnionSource};
 use super::{BasicObject, ResolvableObject, TypeMapping, ValueMapping};
 use crate::constants::{
     DATETIME_FORMAT, ENTITY_NAMES, ENTITY_TABLE, ENTITY_TYPE_NAME, EVENT_ID_COLUMN, ID_COLUMN,
 };
 use crate::mapping::ENTITY_TYPE_MAPPING;
 use crate::object::{resolve_many, resolve_one};
-use crate::query::{build_type_mapping, value_mapping_from_row};
-use crate::utils;
 #[derive(Debug)]
 pub struct EntityObject;
 
@@ -39,7 +36,7 @@ impl BasicObject for EntityObject {
     }
 
     fn related_fields(&self) -> Option<Vec<Field>> {
-        Some(vec![model_union_field()])
+        Some(vec![model_union_field(ModelUnionSource::Entity)])
     }
 }
 
@@ -143,64 +140,4 @@ impl EntityObject {
             ),
         ])
     }
-}
-
-fn model_union_field() -> Field {
-    Field::new("models", TypeRef::named_list("ModelUnion"), move |ctx| {
-        FieldFuture::new(async move {
-            match ctx.parent_value.try_to_value()? {
-                Value::Object(indexmap) => {
-                    let mut conn = ctx.data::<Pool<Sqlite>>()?.acquire().await?;
-
-                    let entity_id = utils::extract::<String>(indexmap, "id")?;
-                    // fetch name from the models table
-                    // using the model id (hashed model name)
-                    let model_ids: Vec<(String, String, String)> = sqlx::query_as(
-                        "SELECT namespace, name, schema
-                        FROM models
-                        WHERE id IN (    
-                            SELECT model_id
-                            FROM entity_model
-                            WHERE entity_id = ?
-                        )",
-                    )
-                    .bind(&entity_id)
-                    .fetch_all(&mut *conn)
-                    .await?;
-
-                    let mut results: Vec<FieldValue<'_>> = Vec::new();
-                    for (namespace, name, schema) in model_ids {
-                        let schema: Ty = serde_json::from_str(&schema).map_err(|e| {
-                            anyhow::anyhow!(format!("Failed to parse model schema: {e}"))
-                        })?;
-                        let type_mapping = build_type_mapping(&namespace, &schema);
-
-                        // Get the table name
-                        let table_name = get_tag(&namespace, &name);
-
-                        // Fetch the row data
-                        let query = format!(
-                            "SELECT * FROM [{}] WHERE internal_entity_id = ?",
-                            table_name
-                        );
-                        let row = sqlx::query(&query)
-                            .bind(&entity_id)
-                            .fetch_one(&mut *conn)
-                            .await?;
-
-                        // Use value_mapping_from_row to handle nested structures
-                        let data = value_mapping_from_row(&row, &type_mapping, false, false)?;
-
-                        results.push(FieldValue::with_type(
-                            FieldValue::owned_any(data),
-                            utils::type_name_from_names(&namespace, &name),
-                        ))
-                    }
-
-                    Ok(Some(FieldValue::list(results)))
-                }
-                _ => Err("incorrect value, requires Value::Object".into()),
-            }
-        })
-    })
 }
