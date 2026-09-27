@@ -3,12 +3,12 @@ use async_graphql::dynamic::{
     Field, InputValue, SubscriptionField, SubscriptionFieldFuture, TypeRef,
 };
 use async_graphql::{Name, Value};
-use sqlx::{Pool, Sqlite};
 use tokio_stream::StreamExt;
 use torii_broker::types::EntityUpdate;
 use torii_broker::MemoryBroker;
 use torii_sqlite::types::Entity;
-use torii_sqlite::utils::felt_to_sql_string;
+use torii_sqlite::utils::{felt_to_sql_string, felts_to_sql_string};
+use torii_storage::proto::schema::EntityWithMetadata;
 use torii_storage::utils::format_world_scoped_id;
 
 use super::inputs::keys_input::keys_argument;
@@ -72,46 +72,20 @@ impl ResolvableObject for EntityObject {
                         Some(id) => Some(id.string()?.to_string()),
                         None => None,
                     };
-                    let pool = ctx.data::<Pool<Sqlite>>()?.clone();
                     // if id is None, then subscribe to all entities
                     // if id is Some, then subscribe to only the entity with that id
-                    Ok(MemoryBroker::<EntityUpdate>::subscribe()
-                        .then(move |entity| {
-                            let pool = pool.clone();
-                            let id = id.clone();
-                            async move {
-                                let entity_id = felt_to_sql_string(&entity.entity.hashed_keys);
-                                let scoped_entity_id = format_world_scoped_id(
-                                    &entity.entity.world_address,
-                                    &entity.entity.hashed_keys,
-                                );
-                                if id.is_none()
-                                    || id == Some(entity_id.clone())
-                                    || id == Some(scoped_entity_id.clone())
-                                {
-                                    let mut conn = match pool.acquire().await {
-                                        Ok(conn) => conn,
-                                        Err(_) => return None,
-                                    };
-
-                                    let entity = match sqlx::query_as::<_, Entity>(
-                                        "SELECT * FROM entities WHERE id = ?",
-                                    )
-                                    .bind(&scoped_entity_id)
-                                    .fetch_one(&mut *conn)
-                                    .await
-                                    {
-                                        Ok(entity) => entity,
-                                        Err(_) => return None,
-                                    };
-
-                                    Some(Ok(Value::Object(EntityObject::value_mapping(entity))))
-                                } else {
-                                    None
-                                }
-                            }
-                        })
-                        .filter_map(|result| result))
+                    Ok(
+                        MemoryBroker::<EntityUpdate>::subscribe().filter_map(move |update| {
+                            let entity = entity_row_from_update(&update);
+                            let matches = match &id {
+                                None => true,
+                                Some(id) => *id == entity.entity_id || *id == entity.id,
+                            };
+                            // a deleted entity has no row left to be resolved from
+                            (matches && !update.deleted)
+                                .then(|| Ok(Value::Object(EntityObject::value_mapping(entity))))
+                        }),
+                    )
                 })
             },
         )
@@ -139,5 +113,29 @@ impl EntityObject {
                 Value::from(entity.executed_at.format(DATETIME_FORMAT).to_string()),
             ),
         ])
+    }
+}
+
+/// Rebuilds the `entities` (or `event_messages`) row an update was published for.
+///
+/// The executor publishes updates, once committed, from the rows it wrote: the rebuilt row holds
+/// the values the table had for this update, without querying it again for every subscriber.
+pub(crate) fn entity_row_from_update<const EVENT_MESSAGE: bool>(
+    update: &EntityWithMetadata<EVENT_MESSAGE>,
+) -> Entity {
+    let entity = &update.entity;
+    Entity {
+        id: format_world_scoped_id(&entity.world_address, &entity.hashed_keys),
+        entity_id: felt_to_sql_string(&entity.hashed_keys),
+        world_address: felt_to_sql_string(&entity.world_address),
+        // the update's keys are parsed from the keys column, written by `felts_to_sql_string`
+        keys: felts_to_sql_string(&update.keys),
+        event_id: update.event_id.clone(),
+        executed_at: entity.executed_at,
+        created_at: entity.created_at,
+        updated_at: entity.updated_at,
+        updated_model: None,
+        deleted: update.deleted,
+        match_model: None,
     }
 }

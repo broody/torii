@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use async_graphql::dynamic::{Field, FieldFuture, FieldValue, Object, Schema, TypeRef, Union};
     use async_graphql::{Name, Value};
@@ -16,8 +18,10 @@ mod tests {
     use starknet::providers::JsonRpcClient;
     use starknet_crypto::{poseidon_hash_many, Felt};
     use tokio::sync::broadcast;
+    use tokio_stream::StreamExt;
     use torii_messaging::Messaging;
     use torii_sqlite::executor::Executor;
+    use torii_sqlite::types::Entity;
     use torii_sqlite::utils::felt_to_sql_string;
     use torii_sqlite::Sql;
     use torii_storage::proto::{ContractDefinition, ContractType};
@@ -26,6 +30,8 @@ mod tests {
     use url::Url;
 
     use crate::constants::INTERNAL_ENTITY_ID_KEY;
+    use crate::object::entity::EntityObject;
+    use crate::object::event_message::EventMessageObject;
     use crate::object::model_data::{object, EntityRowId, EventMessageRowId, ModelNodeLoader};
     use crate::query::build_type_mapping;
     use crate::schema::build_schema;
@@ -587,5 +593,157 @@ mod tests {
             .await
             .unwrap();
         assert!(event_message.is_none());
+    }
+
+    /// Runs `subscriptions` on `schema`, calls `publish` once they listen and returns the first
+    /// `count` responses of each.
+    async fn subscription_responses(
+        schema: &Schema,
+        subscriptions: &[String],
+        count: usize,
+        publish: impl Future<Output = ()>,
+    ) -> Vec<Vec<serde_json::Value>> {
+        let handles: Vec<_> = subscriptions
+            .iter()
+            .map(|subscription| {
+                let schema = schema.clone();
+                let subscription = subscription.clone();
+                tokio::spawn(async move {
+                    schema
+                        .execute_stream(subscription)
+                        .take(count)
+                        .map(|response| {
+                            assert!(response.errors.is_empty(), "{:?}", response.errors);
+                            serde_json::to_value(response.data).unwrap()
+                        })
+                        .collect::<Vec<_>>()
+                        .await
+                })
+            })
+            .collect();
+
+        // let the subscriptions subscribe to the broker
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        publish.await;
+
+        let mut responses = vec![];
+        for handle in handles {
+            let response = tokio::time::timeout(Duration::from_secs(10), handle)
+                .await
+                .expect("subscription timed out");
+            responses.push(response.unwrap());
+        }
+        responses
+    }
+
+    const ENTITY_FIELDS: &str = "id keys eventId createdAt updatedAt executedAt";
+
+    // `entityUpdated` is built from the broker update instead of reading the entity back: it must
+    // match the row the update was published for, and skip deleted entities which have no row.
+    #[sqlx::test(migrations = "../migrations")]
+    #[serial]
+    async fn test_entity_updated_from_broker_update(pool: SqlitePool) {
+        let (db, _shutdown_tx) = setup_db(&pool).await;
+        register_model(&db, &player_stats(Felt::ZERO, None)).await;
+        db.execute().await.unwrap();
+        let schema = schema(&db).await;
+
+        let deleted = player_stats(Felt::ONE, Some(1));
+        let publisher = db.clone();
+        let deleted_model = deleted.clone();
+        let responses = subscription_responses(
+            &schema,
+            &[format!(
+                "subscription {{ entityUpdated {{ {ENTITY_FIELDS} }} }}"
+            )],
+            2,
+            async move {
+                set_entity(&publisher, &deleted_model, "0x1:0x0:0x0").await;
+                publisher.execute().await.unwrap();
+                publisher
+                    .delete_entity(
+                        Felt::ZERO,
+                        poseidon_hash_many(&keys(&deleted_model)),
+                        compute_selector_from_tag(&deleted_model.name()),
+                        deleted_model,
+                        "0x2:0x0:0x0",
+                        BLOCK_TIMESTAMP,
+                    )
+                    .await
+                    .unwrap();
+                publisher.execute().await.unwrap();
+                set_entity(&publisher, &player_stats(Felt::TWO, Some(2)), "0x3:0x0:0x0").await;
+                publisher.execute().await.unwrap();
+            },
+        )
+        .await
+        .remove(0);
+
+        // the deleted entity's row is gone, check what identifies its update
+        let deleted_id = format_world_scoped_id(&Felt::ZERO, &poseidon_hash_many(&keys(&deleted)));
+        let first = &responses[0]["entityUpdated"];
+        assert_eq!(first["id"], deleted_id.as_str());
+        assert_eq!(first["keys"], json!([felt_to_sql_string(&Felt::ONE)]));
+        assert_eq!(first["eventId"], "0x1:0x0:0x0");
+
+        // the second update is the next entity set, not the deletion
+        let id = format_world_scoped_id(&Felt::ZERO, &poseidon_hash_many(&[Felt::TWO]));
+        let row: Entity = sqlx::query_as("SELECT * FROM entities WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            responses[1],
+            json!({ "entityUpdated": Value::Object(EntityObject::value_mapping(row)) })
+        );
+    }
+
+    // `eventMessageUpdated` is built from the broker update, and can be filtered by the event
+    // message id or by its hashed keys.
+    #[sqlx::test(migrations = "../migrations")]
+    #[serial]
+    async fn test_event_message_updated_from_broker_update(pool: SqlitePool) {
+        let (db, _shutdown_tx) = setup_db(&pool).await;
+        register_model(&db, &player_stats(Felt::ZERO, None)).await;
+        db.execute().await.unwrap();
+        let schema = schema(&db).await;
+
+        let hashed_keys = poseidon_hash_many(&[Felt::TWO]);
+        let id = format_world_scoped_id(&Felt::ZERO, &hashed_keys);
+        let fields =
+            format!("{ENTITY_FIELDS} models {{ __typename ... on ns_Player_Stats {{ score }} }}");
+        let subscription = |id: &str| {
+            format!("subscription {{ eventMessageUpdated(id: \"{id}\") {{ {fields} }} }}")
+        };
+
+        let publisher = db.clone();
+        let responses = subscription_responses(
+            &schema,
+            &[
+                subscription(&id),
+                subscription(&format!("{hashed_keys:#x}")),
+            ],
+            1,
+            async move {
+                set_event_message(&publisher, &player_stats(Felt::ONE, Some(7)), "0x1:0x0:0x0")
+                    .await;
+                set_event_message(&publisher, &player_stats(Felt::TWO, Some(9)), "0x2:0x0:0x0")
+                    .await;
+                publisher.execute().await.unwrap();
+            },
+        )
+        .await;
+
+        let row: Entity = sqlx::query_as("SELECT * FROM event_messages WHERE id = ?")
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let mut event_message =
+            serde_json::to_value(Value::Object(EventMessageObject::value_mapping(row))).unwrap();
+        event_message["models"] = json!([{ "__typename": "ns_Player_Stats", "score": 9 }]);
+        let expected = vec![json!({ "eventMessageUpdated": event_message })];
+        assert_eq!(responses, [expected.clone(), expected]);
     }
 }

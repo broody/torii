@@ -117,6 +117,8 @@ impl ResolvableObject for ModelObject {
                                         || id == Some(model_id.clone())
                                         || id == Some(scoped_model_id.clone())
                                     {
+                                        // Unlike entity updates, the published model lacks the
+                                        // row's `createdAt` and `executedAt`: read it back.
                                         let mut conn = match pool.acquire().await {
                                             Ok(conn) => conn,
                                             Err(_) => return None,

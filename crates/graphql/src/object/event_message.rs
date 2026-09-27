@@ -5,14 +5,13 @@ use async_graphql::dynamic::{
     Field, InputValue, SubscriptionField, SubscriptionFieldFuture, TypeRef,
 };
 use async_graphql::{Name, Value};
-use sqlx::{Pool, Sqlite};
 use starknet_crypto::Felt;
 use tokio_stream::StreamExt;
 use torii_broker::types::EventMessageUpdate;
 use torii_broker::MemoryBroker;
 use torii_sqlite::types::Entity;
-use torii_sqlite::utils::felt_to_sql_string;
 
+use super::entity::entity_row_from_update;
 use super::inputs::keys_input::keys_argument;
 use super::model_data::{model_union_field, ModelUnionSource};
 use super::{BasicObject, ResolvableObject, TypeMapping, ValueMapping};
@@ -73,40 +72,28 @@ impl ResolvableObject for EventMessageObject {
             |ctx| {
                 SubscriptionFieldFuture::new(async move {
                     let id = match ctx.args.get("id") {
-                        Some(id) => Some(Felt::from_str(id.string()?).unwrap()),
+                        Some(id) => Some(id.string()?.to_string()),
                         None => None,
                     };
-                    let pool = ctx.data::<Pool<Sqlite>>()?.clone();
-                    Ok(MemoryBroker::<EventMessageUpdate>::subscribe()
-                        .then(move |entity| {
-                            let pool = pool.clone();
-                            async move {
-                                if id.is_none() || id == Some(entity.entity.hashed_keys) {
-                                    let mut conn = match pool.acquire().await {
-                                        Ok(conn) => conn,
-                                        Err(_) => return None,
-                                    };
-
-                                    let entity = match sqlx::query_as::<_, Entity>(
-                                        "SELECT * FROM event_messages WHERE id = ?",
-                                    )
-                                    .bind(felt_to_sql_string(&entity.entity.hashed_keys))
-                                    .fetch_one(&mut *conn)
-                                    .await
-                                    {
-                                        Ok(entity) => entity,
-                                        Err(_) => return None,
-                                    };
-
-                                    Some(Ok(Value::Object(EventMessageObject::value_mapping(
-                                        entity,
-                                    ))))
-                                } else {
-                                    None
+                    // the id is either the event message id or its hashed keys
+                    let hashed_keys = id.as_deref().and_then(|id| Felt::from_str(id).ok());
+                    Ok(
+                        MemoryBroker::<EventMessageUpdate>::subscribe().filter_map(move |update| {
+                            let event_message = entity_row_from_update(&update);
+                            let matches = match &id {
+                                None => true,
+                                Some(id) => {
+                                    hashed_keys == Some(update.entity.hashed_keys)
+                                        || *id == event_message.id
                                 }
-                            }
-                        })
-                        .filter_map(|result| result))
+                            };
+                            matches.then(|| {
+                                Ok(Value::Object(EventMessageObject::value_mapping(
+                                    event_message,
+                                )))
+                            })
+                        }),
+                    )
                 })
             },
         )
