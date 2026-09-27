@@ -68,10 +68,8 @@ pub trait BasicObject: Send + Sync {
                 FieldFuture::new(async move {
                     match ctx.parent_value.try_to_value() {
                         Ok(Value::Object(values)) => {
-                            // safe unwrap
-                            return Ok(Some(FieldValue::value(
-                                values.get(&field_name).unwrap().clone(),
-                            )));
+                            // a field missing from the parent value resolves to null
+                            return Ok(values.get(&field_name).cloned().map(FieldValue::value));
                         }
                         // if the parent is `Value` then it must be a Object
                         Ok(_) => return Err("incorrect value, requires Value::Object".into()),
@@ -385,4 +383,66 @@ pub fn resolve_many(
     field = connection_arguments(field);
 
     field
+}
+
+#[cfg(test)]
+mod tests {
+    use async_graphql::dynamic::Schema;
+    use async_graphql::{value, Name};
+
+    use super::*;
+    use crate::types::TypeData;
+
+    struct TestObject {
+        type_mapping: TypeMapping,
+    }
+
+    impl BasicObject for TestObject {
+        fn name(&self) -> (&str, &str) {
+            ("test", "tests")
+        }
+
+        fn type_name(&self) -> &str {
+            "Test"
+        }
+
+        fn type_mapping(&self) -> &TypeMapping {
+            &self.type_mapping
+        }
+    }
+
+    #[tokio::test]
+    async fn field_missing_from_parent_value_resolves_to_null() {
+        let object = TestObject {
+            type_mapping: TypeMapping::from([
+                (
+                    Name::new("present"),
+                    TypeData::Simple(TypeRef::named(TypeRef::STRING)),
+                ),
+                (
+                    Name::new("missing"),
+                    TypeData::Simple(TypeRef::named(TypeRef::STRING)),
+                ),
+            ]),
+        };
+
+        let query = Object::new("Query").field(Field::new("test", TypeRef::named("Test"), |_| {
+            FieldFuture::new(async {
+                let value = ValueMapping::from([(Name::new("present"), Value::from("here"))]);
+                Ok::<_, async_graphql::Error>(Some(Value::Object(value)))
+            })
+        }));
+        let mut builder = Schema::build("Query", None, None).register(query);
+        for object in object.objects() {
+            builder = builder.register(object);
+        }
+        let schema = builder.finish().unwrap();
+
+        let response = schema.execute("{ test { present missing } }").await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert_eq!(
+            response.data,
+            value!({ "test": { "present": "here", "missing": null } })
+        );
+    }
 }
