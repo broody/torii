@@ -11,13 +11,19 @@ mod tests {
     use torii_sqlite::utils::{felt_to_sql_string, felts_to_sql_string};
     use torii_storage::proto::{CallType, Transaction, TransactionCall};
 
-    use crate::tests::erc_test::tests::{first_subscription_item, schema};
+    use crate::tests::erc_test::tests::{
+        first_subscription_item, insert_contract, insert_token, insert_transfer, schema,
+        TOKEN_FIELDS,
+    };
+    use crate::tests::run_graphql_query;
 
     // Short enough to have leading zeros once padded, which the `transactions` query strips.
     const TRANSACTION_HASH: Felt = Felt::from_hex_unchecked("0x123");
     const OTHER_TRANSACTION_HASH: Felt = Felt::from_hex_unchecked("0x124");
     const CALLER: Felt = Felt::from_hex_unchecked("0xca11");
     const ERC20: Felt = Felt::from_hex_unchecked("0x60");
+    const ERC721: Felt = Felt::from_hex_unchecked("0x61");
+    const NOT_A_TOKEN: Felt = Felt::from_hex_unchecked("0x62");
 
     async fn insert_transaction(pool: &SqlitePool, transaction_hash: Felt) {
         sqlx::query(
@@ -49,6 +55,71 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn test_transaction_calls_and_token_transfers(pool: SqlitePool) {
+        let schema = schema(&pool).await;
+        insert_transaction(&pool, TRANSACTION_HASH).await;
+        insert_transaction(&pool, OTHER_TRANSACTION_HASH).await;
+        for (contract, contract_type) in
+            [(ERC20, "ERC20"), (ERC721, "ERC721"), (NOT_A_TOKEN, "OTHER")]
+        {
+            insert_contract(&pool, contract, contract_type).await;
+            insert_token(&pool, contract, None, None).await;
+        }
+        // The metadata fetch of this NFT failed.
+        insert_token(&pool, ERC721, Some(1), Some("")).await;
+
+        let transfers = [
+            (TRANSACTION_HASH, ERC20, None),
+            (TRANSACTION_HASH, ERC721, Some(1)),
+            // Can't be represented as a token transfer, and must not fail the field.
+            (TRANSACTION_HASH, NOT_A_TOKEN, None),
+            (OTHER_TRANSACTION_HASH, ERC20, None),
+        ];
+        for (block, (transaction_hash, contract, token_id)) in (1..).zip(transfers) {
+            insert_transfer(
+                &pool,
+                block,
+                transaction_hash,
+                contract,
+                token_id,
+                CALLER,
+                Felt::ONE,
+                1,
+            )
+            .await;
+        }
+
+        let query = format!(
+            "{{ transactions {{ edges {{ node {{ transactionHash calls {{ entrypoint }} \
+             tokenTransfers {{ transactionHash {TOKEN_FIELDS} }} }} }} }} }}"
+        );
+        let result = run_graphql_query(&schema, &query).await;
+        let node = result["transactions"]["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|edge| &edge["node"])
+            .find(|node| node["transactionHash"] == format!("{TRANSACTION_HASH:#x}"))
+            .unwrap();
+
+        assert_eq!(node["calls"], json!([{ "entrypoint": "transfer" }]));
+
+        let transfers = node["tokenTransfers"].as_array().unwrap();
+        let mut types: Vec<&str> = transfers
+            .iter()
+            .map(|transfer| transfer["tokenMetadata"]["__typename"].as_str().unwrap())
+            .collect();
+        types.sort();
+        assert_eq!(types, ["ERC20__Token", "ERC721__Token"]);
+        for transfer in transfers {
+            assert_eq!(
+                transfer["transactionHash"],
+                felt_to_sql_string(&TRANSACTION_HASH)
+            );
+        }
     }
 
     fn transaction(transaction_hash: Felt, caller: Felt) -> TransactionUpdate {

@@ -16,12 +16,14 @@ use tracing::warn;
 
 use super::{BasicObject, ResolvableObject, TypeMapping, ValueMapping};
 use crate::constants::{
-    CALL_TYPE_NAME, ID_COLUMN, TOKEN_TRANSFER_TABLE, TOKEN_TRANSFER_TYPE_NAME,
-    TRANSACTION_CALLS_TABLE, TRANSACTION_HASH_COLUMN, TRANSACTION_NAMES, TRANSACTION_TABLE,
-    TRANSACTION_TYPE_NAME,
+    CALL_TYPE_NAME, ID_COLUMN, TOKEN_TRANSFER_TYPE_NAME, TRANSACTION_CALLS_TABLE,
+    TRANSACTION_HASH_COLUMN, TRANSACTION_NAMES, TRANSACTION_TABLE, TRANSACTION_TYPE_NAME,
 };
 use crate::mapping::{CALL_MAPPING, TRANSACTION_MAPPING};
-use crate::object::erc::token_transfer::{token_transfer_mapping_from_row, TransferQueryResultRaw};
+use crate::object::erc::token_transfer::{
+    mappable_transfer_condition, token_transfer_mapping_from_row, transfers_from,
+    TransferQueryResultRaw, TRANSFER_COLUMNS,
+};
 use crate::object::{resolve_many, resolve_one};
 use crate::query::value_mapping_from_row;
 use crate::utils;
@@ -230,6 +232,19 @@ impl TransactionObject {
     }
 }
 
+/// Returns the hash of the parent transaction in the format it is stored in: the transaction
+/// queries strip leading zeros from felts.
+fn parent_transaction_hash(indexmap: &ValueMapping) -> async_graphql::Result<String> {
+    let transaction_hash = utils::extract::<String>(indexmap, "transactionHash")?;
+    let transaction_hash = Felt::from_str(&transaction_hash).map_err(|_| {
+        async_graphql::Error::new(format!("Invalid transaction hash: {transaction_hash}"))
+    })?;
+    Ok(felt_to_sql_string(&transaction_hash))
+}
+
+// NOTE: `calls` and `tokenTransfers` run one query per transaction. Batching them across the
+// transactions of a page needs a DataLoader (async-graphql `dataloader` feature) or support from
+// the shared `resolve_many`.
 fn calls_field() -> Field {
     Field::new("calls", TypeRef::named_list(CALL_TYPE_NAME), move |ctx| {
         FieldFuture::new(async move {
@@ -237,7 +252,7 @@ fn calls_field() -> Field {
                 Value::Object(indexmap) => {
                     let mut conn = ctx.data::<Pool<Sqlite>>()?.acquire().await?;
 
-                    let transaction_hash = utils::extract::<String>(indexmap, "transactionHash")?;
+                    let transaction_hash = parent_transaction_hash(indexmap)?;
 
                     // Fetch all function calls for this transaction
                     let query = &format!(
@@ -274,46 +289,31 @@ fn token_transfers_field() -> Field {
                     Value::Object(indexmap) => {
                         let mut conn = ctx.data::<Pool<Sqlite>>()?.acquire().await?;
 
-                        let transaction_hash =
-                            utils::extract::<String>(indexmap, "transactionHash")?;
+                        let transaction_hash = parent_transaction_hash(indexmap)?;
 
-                        // Fetch all token transfers for this transaction
+                        // Fetch all token transfers for this transaction. Event ids are
+                        // `block_number:transaction_hash:contract_address:event_idx`, and a
+                        // formatted felt contains no LIKE wildcard.
                         let query = format!(
-                            r#"
-                        SELECT 
-                            et.id,
-                            et.contract_address,
-                            et.from_address,
-                            et.to_address,
-                            et.amount,
-                            et.token_id,
-                            et.executed_at,
-                            t.name,
-                            t.symbol,
-                            t.decimals,
-                            c.contract_type,
-                            t.metadata
-                        FROM
-                            {TOKEN_TRANSFER_TABLE} et
-                        JOIN
-                            tokens t ON et.token_id = t.id
-                        JOIN
-                            contracts c ON t.contract_address = c.contract_address
-                        WHERE
-                            et.event_id LIKE '%:{transaction_hash}:%'
-                        "#
+                            "SELECT {TRANSFER_COLUMNS} {} WHERE et.event_id LIKE ? AND {}",
+                            transfers_from(),
+                            mappable_transfer_condition()
                         );
 
                         let rows = sqlx::query(&query)
-                            .bind(&transaction_hash)
+                            .bind(format!("%:{transaction_hash}:%"))
                             .fetch_all(&mut *conn)
                             .await?;
 
                         let mut results = Vec::new();
                         for row in &rows {
                             let row = TransferQueryResultRaw::from_row(row)?;
-                            let result = token_transfer_mapping_from_row(&row)?;
-                            results.push(FieldValue::owned_any(result));
+                            match token_transfer_mapping_from_row(&row) {
+                                Ok(result) => results.push(FieldValue::owned_any(result)),
+                                Err(error) => {
+                                    warn!(%error, "Failed to map token transfer.");
+                                }
+                            }
                         }
 
                         Ok(Some(FieldValue::list(results)))

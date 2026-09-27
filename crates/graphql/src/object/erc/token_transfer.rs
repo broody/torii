@@ -5,7 +5,6 @@ use serde::Deserialize;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{FromRow, Pool, Row, Sqlite, SqliteConnection};
 use starknet_crypto::Felt;
-use torii_sqlite::constants::TOKEN_TRANSFER_TABLE;
 use torii_sqlite::utils::felt_to_sql_string;
 use torii_storage::utils::parse_event_id;
 use tracing::warn;
@@ -15,7 +14,9 @@ use super::{
     handle_cursor, map_token, mappable_token_condition, Connection, ConnectionEdge, TokenColumns,
     TokenMappingError,
 };
-use crate::constants::{DEFAULT_LIMIT, ID_COLUMN, TOKEN_TRANSFER_NAME, TOKEN_TRANSFER_TYPE_NAME};
+use crate::constants::{
+    DEFAULT_LIMIT, ID_COLUMN, TOKEN_TRANSFER_NAME, TOKEN_TRANSFER_TABLE, TOKEN_TRANSFER_TYPE_NAME,
+};
 use crate::mapping::TOKEN_TRANSFER_TYPE_MAPPING;
 use crate::object::connection::page_info::PageInfoObject;
 use crate::object::connection::{
