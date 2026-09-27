@@ -13,9 +13,17 @@ pub struct OrderInputObject {
 
 impl OrderInputObject {
     pub fn new(type_name: &str, object_types: &TypeMapping) -> Self {
+        // Only simple members map to a single SQL column that can be ordered by; nested structs,
+        // complex enums and arrays cannot.
+        let type_mapping = object_types
+            .iter()
+            .filter(|(_, type_data)| type_data.is_simple())
+            .map(|(name, type_data)| (name.clone(), type_data.clone()))
+            .collect();
+
         Self {
             type_name: format!("{}Order", type_name),
-            type_mapping: object_types.clone(),
+            type_mapping,
         }
     }
 }
