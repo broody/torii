@@ -9,8 +9,8 @@ use strum::IntoEnumIterator;
 
 use super::InputObjectTrait;
 use crate::object::TypeMapping;
-use crate::query::filter::{parse_filter, Comparator, Filter, FilterValue};
-use crate::types::TypeData;
+use crate::query::filter::{parse_comparator, parse_filter, Comparator, Filter, FilterValue};
+use crate::types::{GraphqlType, TypeData};
 
 /// Format a value using the same formatting as Primitive::to_sql_value().
 ///
@@ -234,25 +234,16 @@ fn parse_where_value(
                 return Ok(vec![filter]);
             }
 
-            let primitive = Primitive::from_str(&type_data.type_ref().to_string())?;
-            let filter_value = match primitive.to_sql_type() {
-                SqlType::Integer => parse_integer(input, field_path, primitive)?,
-                SqlType::Text => parse_string(input, field_path, primitive)?,
-            };
+            let filter_value = parse_scalar(input, field_path, &type_data.type_ref().to_string())?;
 
             Ok(vec![parse_filter(&Name::new(field_path), filter_value)])
         }
         TypeData::List(inner) => {
             let list = input.list()?;
+            let type_name = inner.type_ref().to_string();
             let values = list
                 .iter()
-                .map(|value| {
-                    let primitive = Primitive::from_str(&inner.type_ref().to_string())?;
-                    match primitive.to_sql_type() {
-                        SqlType::Integer => parse_integer(value, field_path, primitive),
-                        SqlType::Text => parse_string(value, field_path, primitive),
-                    }
-                })
+                .map(|value| parse_scalar(value, field_path, &type_name))
                 .collect::<Result<Vec<_>>>()?;
 
             Ok(vec![parse_filter(
@@ -282,6 +273,38 @@ pub fn parse_where_argument(
     })
 }
 
+/// Parses a filter value of the member type `type_name` given to the where-input field
+/// `field_path`.
+fn parse_scalar(
+    input: ValueAccessor<'_>,
+    field_path: &str,
+    type_name: &str,
+) -> Result<FilterValue> {
+    // ByteArray members are stored verbatim in a TEXT column.
+    if type_name == GraphqlType::ByteArray.as_ref() {
+        return parse_text(input, field_path);
+    }
+
+    let primitive = Primitive::from_str(type_name).map_err(|_| {
+        GqlError::new(format!(
+            "Filtering on type {} is not supported (field {})",
+            type_name, field_path
+        ))
+    })?;
+
+    match primitive.to_sql_type() {
+        SqlType::Integer => parse_integer(input, field_path, primitive),
+        SqlType::Text => parse_string(input, field_path, primitive),
+    }
+}
+
+fn parse_text(input: ValueAccessor<'_>, field_path: &str) -> Result<FilterValue> {
+    input
+        .string()
+        .map(|s| FilterValue::String(s.to_string()))
+        .map_err(|_| GqlError::new(format!("Expected string on field {}", field_path)))
+}
+
 fn parse_integer(
     input: ValueAccessor<'_>,
     type_name: &str,
@@ -304,23 +327,27 @@ fn parse_string(
     type_name: &str,
     primitive: Primitive,
 ) -> Result<FilterValue> {
-    match input.string() {
-        Ok(i) => {
-            // Use the primitive's own formatting logic for consistency
-            match format_value_with_primitive_formatting(i, primitive) {
-                Ok(formatted_value) => Ok(FilterValue::String(formatted_value)),
-                Err(err) => {
-                    // If parsing fails, fallback to original string for backward compatibility
-                    eprintln!("Warning: primitive formatting failed for '{}': {}", i, err);
-                    Ok(FilterValue::String(i.to_string()))
-                }
-            }
-        }
-        Err(_) => Err(GqlError::new(format!(
-            "Expected string on field {}",
-            type_name
+    let value = input
+        .string()
+        .map_err(|_| GqlError::new(format!("Expected string on field {}", type_name)))?;
+
+    // Use the primitive's own formatting logic so values match how they are stored
+    match format_value_with_primitive_formatting(value, primitive) {
+        Ok(formatted_value) => Ok(FilterValue::String(formatted_value)),
+        // LIKE patterns (e.g. `0x%`) are not valid values of the primitive; match them verbatim.
+        Err(_) if is_pattern_field(type_name) => Ok(FilterValue::String(value.to_string())),
+        Err(err) => Err(GqlError::new(format!(
+            "Invalid {} value \"{}\" on field {}: {}",
+            primitive, value, type_name, err
         ))),
     }
+}
+
+fn is_pattern_field(field_path: &str) -> bool {
+    matches!(
+        parse_comparator(field_path).1,
+        Comparator::Like | Comparator::NotLike
+    )
 }
 
 #[cfg(test)]

@@ -53,21 +53,23 @@ pub struct Filter {
     pub value: FilterValue,
 }
 
-pub fn parse_filter(input: &Name, value: FilterValue) -> Filter {
+/// Splits a where-input field name (e.g. `scoreGTE`) into the column name and its comparator.
+/// Without a known suffix the comparison is an equality.
+pub fn parse_comparator(input: &str) -> (&str, Comparator) {
     for comparator in Comparator::iter() {
         if let Some(field) = input.strip_suffix(comparator.as_ref()) {
-            return Filter {
-                field: field.to_string(),
-                comparator: comparator.clone(),
-                value,
-            };
+            return (field, comparator);
         }
     }
 
-    // If no suffix found assume equality comparison
+    (input, Comparator::Eq)
+}
+
+pub fn parse_filter(input: &Name, value: FilterValue) -> Filter {
+    let (field, comparator) = parse_comparator(input);
     Filter {
-        field: input.to_string(),
-        comparator: Comparator::Eq,
+        field: field.to_string(),
+        comparator,
         value,
     }
 }
