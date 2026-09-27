@@ -40,6 +40,7 @@ use torii_storage::Storage;
 
 mod dynamic_schema_test;
 mod entities_test;
+mod erc_test;
 mod events_test;
 mod metadata_test;
 mod models_ordering_test;

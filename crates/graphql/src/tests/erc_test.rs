@@ -1,0 +1,311 @@
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use async_graphql::dynamic::Schema;
+    use serde_json::Value;
+    use sqlx::SqlitePool;
+    use starknet::core::types::{Felt, U256};
+    use starknet::providers::jsonrpc::HttpTransport;
+    use starknet::providers::JsonRpcClient;
+    use tokio::sync::broadcast;
+    use torii_messaging::{Messaging, MessagingConfig};
+    use torii_sqlite::executor::Executor;
+    use torii_sqlite::utils::{
+        felt_and_u256_to_sql_string, felt_to_sql_string, u256_to_sql_string,
+    };
+    use torii_sqlite::Sql;
+    use torii_storage::utils::format_event_id;
+    use url::Url;
+
+    use crate::schema::build_schema;
+    use crate::tests::run_graphql_query;
+
+    const ACCOUNT: Felt = Felt::from_hex_unchecked("0xacc");
+    const OTHER: Felt = Felt::from_hex_unchecked("0xbeef");
+
+    const TOKEN_FIELDS: &str = r#"
+        tokenMetadata {
+          __typename
+          ... on ERC20__Token { contractAddress amount }
+          ... on ERC721__Token {
+            contractAddress tokenId metadata metadataName metadataDescription imagePath
+          }
+          ... on ERC1155__Token {
+            contractAddress tokenId amount metadata metadataName imagePath
+          }
+        }"#;
+
+    /// Builds the schema over `pool`. Fixtures are inserted with plain SQL, so the executor is only
+    /// needed while building the schema and shuts down when this returns.
+    async fn schema(pool: &SqlitePool) -> Schema {
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let url: Url = "https://www.example.com".parse().unwrap();
+        let provider = Arc::new(JsonRpcClient::new(HttpTransport::new(url)));
+        let (mut executor, sender) =
+            Executor::new(pool.clone(), shutdown_tx.clone(), provider.clone())
+                .await
+                .unwrap();
+        tokio::spawn(async move {
+            executor.run().await.unwrap();
+        });
+        let db = Sql::new(pool.clone(), sender, &[]).await.unwrap();
+        let messaging = Arc::new(Messaging::new(
+            MessagingConfig::default(),
+            Arc::new(db.clone()),
+            provider,
+        ));
+
+        let schema = build_schema(pool, messaging, Arc::new(db)).await.unwrap();
+        let _ = shutdown_tx.send(());
+        schema
+    }
+
+    fn token_key(contract: Felt, token_id: Option<u64>) -> String {
+        match token_id {
+            Some(id) => felt_and_u256_to_sql_string(&contract, &U256::from(id)),
+            None => felt_to_sql_string(&contract),
+        }
+    }
+
+    async fn insert_contract(pool: &SqlitePool, contract: Felt, contract_type: &str) {
+        sqlx::query("INSERT INTO contracts (id, contract_address, contract_type) VALUES (?, ?, ?)")
+            .bind(felt_to_sql_string(&contract))
+            .bind(felt_to_sql_string(&contract))
+            .bind(contract_type)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// Inserts a `tokens` row: the contract-level row when `token_id` is `None`.
+    async fn insert_token(
+        pool: &SqlitePool,
+        contract: Felt,
+        token_id: Option<u64>,
+        metadata: Option<&str>,
+    ) {
+        sqlx::query(
+            "INSERT INTO tokens (id, contract_address, token_id, name, symbol, decimals, \
+             metadata) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(token_key(contract, token_id))
+        .bind(felt_to_sql_string(&contract))
+        .bind(token_id.map(|id| u256_to_sql_string(&U256::from(id))))
+        .bind("Name")
+        .bind("SYM")
+        .bind(if token_id.is_some() { 0 } else { 18 })
+        .bind(metadata)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_balance(
+        pool: &SqlitePool,
+        account: Felt,
+        contract: Felt,
+        token_id: Option<u64>,
+        balance: u64,
+    ) {
+        let token_key = token_key(contract, token_id);
+        sqlx::query(
+            "INSERT INTO token_balances (id, balance, account_address, contract_address, \
+             token_id) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(format!("{}/{}", felt_to_sql_string(&account), token_key))
+        .bind(u256_to_sql_string(&U256::from(balance)))
+        .bind(felt_to_sql_string(&account))
+        .bind(felt_to_sql_string(&contract))
+        .bind(token_key)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_transfer(
+        pool: &SqlitePool,
+        block_number: u64,
+        transaction_hash: Felt,
+        contract: Felt,
+        token_id: Option<u64>,
+        from: Felt,
+        to: Felt,
+        amount: u64,
+    ) {
+        let event_id = format_event_id(block_number, &transaction_hash, &contract, 0);
+        let token_key = token_key(contract, token_id);
+        sqlx::query(
+            "INSERT INTO token_transfers (id, contract_address, from_address, to_address, \
+             amount, token_id, event_id, executed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(format!("{event_id}:{token_key}"))
+        .bind(felt_to_sql_string(&contract))
+        .bind(felt_to_sql_string(&from))
+        .bind(felt_to_sql_string(&to))
+        .bind(u256_to_sql_string(&U256::from(amount)))
+        .bind(token_key)
+        .bind(event_id)
+        .bind("2024-03-18T09:34:38Z")
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn get<'a>(value: &'a Value, path: &[&str]) -> &'a Value {
+        path.iter().fold(value, |value, key| &value[*key])
+    }
+
+    /// `contract_address[:token_id]` of the token of an edge.
+    fn token_of(edge: &Value) -> String {
+        let token = get(edge, &["node", "tokenMetadata"]);
+        let contract_address = token["contractAddress"].as_str().unwrap();
+        match token["tokenId"].as_str() {
+            Some(token_id) => format!("{contract_address}:{token_id}"),
+            None => contract_address.to_string(),
+        }
+    }
+
+    fn transaction_hash_of(edge: &Value) -> String {
+        get(edge, &["node", "transactionHash"])
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    fn keys(connection: &Value, key: fn(&Value) -> String) -> Vec<String> {
+        connection["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(key)
+            .collect()
+    }
+
+    async fn tokens(schema: &Schema, args: &str) -> Value {
+        let query = format!(
+            "{{ tokens{args} {{ totalCount edges {{ cursor node {{ {TOKEN_FIELDS} }} }} \
+             pageInfo {{ hasPreviousPage hasNextPage startCursor endCursor }} }} }}"
+        );
+        run_graphql_query(schema, &query).await["tokens"].clone()
+    }
+
+    async fn token_balances(schema: &Schema, account: Felt, args: &str) -> Value {
+        let query = format!(
+            "{{ tokenBalances(accountAddress: \"{account:#x}\"{args}) {{ totalCount edges {{ \
+             cursor node {{ {TOKEN_FIELDS} }} }} pageInfo {{ hasPreviousPage hasNextPage \
+             startCursor endCursor }} }} }}"
+        );
+        run_graphql_query(schema, &query).await["tokenBalances"].clone()
+    }
+
+    async fn token_transfers(schema: &Schema, account: Felt, args: &str) -> Value {
+        let query = format!(
+            "{{ tokenTransfers(accountAddress: \"{account:#x}\"{args}) {{ totalCount edges {{ \
+             cursor node {{ from to transactionHash {TOKEN_FIELDS} }} }} pageInfo {{ \
+             hasPreviousPage hasNextPage startCursor endCursor }} }} }}"
+        );
+        run_graphql_query(schema, &query).await["tokenTransfers"].clone()
+    }
+
+    /// Walks a connection forward with `first`/`after` and returns the keys of each page.
+    async fn walk_pages<F, Fut>(
+        page_size: u64,
+        key: fn(&Value) -> String,
+        fetch: F,
+    ) -> Vec<Vec<String>>
+    where
+        F: Fn(String) -> Fut,
+        Fut: std::future::Future<Output = Value>,
+    {
+        let mut pages = vec![];
+        let mut after = String::new();
+        loop {
+            let connection = fetch(format!("first: {page_size}{after}")).await;
+            pages.push(keys(&connection, key));
+            if !connection["pageInfo"]["hasNextPage"].as_bool().unwrap() {
+                return pages;
+            }
+            let end_cursor = connection["pageInfo"]["endCursor"].as_str().unwrap();
+            after = format!(", after: \"{end_cursor}\"");
+            assert!(pages.len() < 10, "pagination does not terminate");
+        }
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn test_tokens_cursor_pagination(pool: SqlitePool) {
+        let schema = schema(&pool).await;
+        let erc20s: Vec<Felt> = (0x10..0x15).map(Felt::from).collect();
+        for contract in &erc20s {
+            insert_contract(&pool, *contract, "ERC20").await;
+            insert_token(&pool, *contract, None, None).await;
+        }
+
+        let pages = walk_pages(2, token_of, |args| {
+            let schema = schema.clone();
+            async move { tokens(&schema, &format!("({args})")).await }
+        })
+        .await;
+
+        let expected: Vec<String> = erc20s.iter().rev().map(felt_to_sql_string).collect();
+        assert_eq!(pages, [&expected[0..2], &expected[2..4], &expected[4..]]);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn test_token_transfers_cursor_pagination(pool: SqlitePool) {
+        let schema = schema(&pool).await;
+        let erc20 = Felt::from(0x20);
+        insert_contract(&pool, erc20, "ERC20").await;
+        insert_token(&pool, erc20, None, None).await;
+        for block in 1..=5 {
+            insert_transfer(
+                &pool,
+                block,
+                Felt::from(block),
+                erc20,
+                None,
+                OTHER,
+                ACCOUNT,
+                block,
+            )
+            .await;
+        }
+
+        let pages = walk_pages(2, transaction_hash_of, |args| {
+            let schema = schema.clone();
+            async move { token_transfers(&schema, ACCOUNT, &format!(", {args}")).await }
+        })
+        .await;
+
+        // Every transfer is returned exactly once, most recent first.
+        let expected: Vec<String> = (1..=5)
+            .rev()
+            .map(|block| felt_to_sql_string(&Felt::from(block)))
+            .collect();
+        assert_eq!(pages, [&expected[0..2], &expected[2..4], &expected[4..]]);
+    }
+
+    // Balance ids (`account/contract:token_id`) contain '/', which `cursor::decode` can't handle
+    // yet; un-ignore once the connection cursor encoding supports it.
+    #[ignore = "requires cursor::decode support for ids containing '/'"]
+    #[sqlx::test(migrations = "../migrations")]
+    async fn test_token_balances_cursor_pagination(pool: SqlitePool) {
+        let schema = schema(&pool).await;
+        let erc20s: Vec<Felt> = (0x30..0x35).map(Felt::from).collect();
+        for contract in &erc20s {
+            insert_contract(&pool, *contract, "ERC20").await;
+            insert_token(&pool, *contract, None, None).await;
+            insert_balance(&pool, ACCOUNT, *contract, None, 1).await;
+        }
+
+        let pages = walk_pages(2, token_of, |args| {
+            let schema = schema.clone();
+            async move { token_balances(&schema, ACCOUNT, &format!(", {args}")).await }
+        })
+        .await;
+
+        let expected: Vec<String> = erc20s.iter().rev().map(felt_to_sql_string).collect();
+        assert_eq!(pages, [&expected[0..2], &expected[2..4], &expected[4..]]);
+    }
+}

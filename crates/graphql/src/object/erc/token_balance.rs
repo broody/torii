@@ -211,22 +211,20 @@ async fn fetch_token_balances(
             .to_string(),
     ];
 
+    let mut binds = vec![felt_to_sql_string(&address)];
+
     let mut cursor_param = &connection.after;
     if let Some(after_cursor) = &connection.after {
-        conditions.push(handle_cursor(
-            after_cursor,
-            CursorDirection::After,
-            ID_COLUMN,
-        )?);
+        let (condition, value) = handle_cursor(after_cursor, CursorDirection::After, &id_column)?;
+        conditions.push(condition);
+        binds.push(value);
     }
 
     if let Some(before_cursor) = &connection.before {
         cursor_param = &connection.before;
-        conditions.push(handle_cursor(
-            before_cursor,
-            CursorDirection::Before,
-            ID_COLUMN,
-        )?);
+        let (condition, value) = handle_cursor(before_cursor, CursorDirection::Before, &id_column)?;
+        conditions.push(condition);
+        binds.push(value);
     }
 
     if !conditions.is_empty() {
@@ -264,10 +262,11 @@ async fn fetch_token_balances(
         query.push_str(&format!(" OFFSET {}", offset));
     }
 
-    let mut data = sqlx::query(&query)
-        .bind(felt_to_sql_string(&address))
-        .fetch_all(conn)
-        .await?;
+    let mut data_query = sqlx::query(&query);
+    for value in &binds {
+        data_query = data_query.bind(value);
+    }
+    let mut data = data_query.fetch_all(conn).await?;
     let mut page_info = PageInfo {
         has_previous_page: false,
         has_next_page: false,
@@ -280,9 +279,10 @@ async fn fetch_token_balances(
     } else if is_cursor_based {
         match cursor_param {
             Some(cursor_query) => {
+                // The selected `b.id` column is named `id` in the result set.
                 let first_cursor = cursor::encode(
-                    &data[0].try_get::<String, &str>(&id_column)?,
-                    &data[0].try_get_unchecked::<String, &str>(&id_column)?,
+                    &data[0].try_get::<String, &str>(ID_COLUMN)?,
+                    &data[0].try_get_unchecked::<String, &str>(ID_COLUMN)?,
                 );
 
                 if &first_cursor == cursor_query && data.len() != 1 {

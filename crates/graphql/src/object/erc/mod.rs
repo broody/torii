@@ -9,18 +9,18 @@ pub mod erc_token;
 pub mod token_balance;
 pub mod token_transfer;
 
+/// Builds the keyset condition for a pagination cursor, returning the SQL condition and the value
+/// to bind to its placeholder.
+///
+/// `id_column` must be qualified with its table alias: the ERC queries join tables that also have
+/// an `id` column.
 fn handle_cursor(
     cursor: &str,
     direction: CursorDirection,
     id_column: &str,
-) -> sqlx::Result<String> {
+) -> sqlx::Result<(String, String)> {
     match cursor::decode(cursor) {
-        Ok((event_id, _)) => Ok(format!(
-            "{} {} '{}'",
-            id_column,
-            direction.as_ref(),
-            event_id
-        )),
+        Ok((id, _)) => Ok((format!("{} {} ?", id_column, direction.as_ref()), id)),
         Err(_) => Err(sqlx::Error::Decode("Invalid cursor format".into())),
     }
 }
