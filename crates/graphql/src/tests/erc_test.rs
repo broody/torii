@@ -586,9 +586,7 @@ pub(crate) mod tests {
         assert_eq!(token["metadataName"], "a \"quoted\" name");
     }
 
-    // Balance ids (`account/contract:token_id`) contain '/', which `cursor::decode` can't handle
-    // yet; un-ignore once the connection cursor encoding supports it.
-    #[ignore = "requires cursor::decode support for ids containing '/'"]
+    // Balance ids (`account/contract:token_id`) contain '/', which cursors must round-trip.
     #[sqlx::test(migrations = "../migrations")]
     async fn test_token_balances_cursor_pagination(pool: SqlitePool) {
         let schema = schema(&pool).await;
