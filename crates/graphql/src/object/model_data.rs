@@ -8,7 +8,9 @@ use dojo_types::schema::Ty;
 use sqlx::{Pool, Row, Sqlite};
 use tracing::debug;
 
-use super::connection::{connection_arguments, connection_output, parse_connection_arguments};
+use super::connection::{
+    connection_arguments, connection_output, parse_connection_arguments, total_count_needed,
+};
 use super::inputs::order_input::{order_argument, parse_order_argument, OrderInputObject};
 use super::inputs::where_input::{parse_where_argument, where_argument, WhereInputObject};
 use super::inputs::InputObjectTrait;
@@ -119,7 +121,11 @@ impl ResolvableObject for ModelDataObject {
                 let filters = parse_where_argument(&ctx, &where_mapping)?;
                 let connection = parse_connection_arguments(&ctx)?;
 
-                let total_count = count_rows(&mut conn, &table_name, &None, &filters).await?;
+                let total_count = if total_count_needed(&ctx, false) {
+                    count_rows(&mut conn, &table_name, &None, &filters).await?
+                } else {
+                    0
+                };
                 let (data, page_info) = fetch_multiple_rows(
                     &mut conn,
                     &table_name,

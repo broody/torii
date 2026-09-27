@@ -25,7 +25,8 @@ use sqlx::{Pool, Sqlite};
 
 use self::connection::edge::EdgeObject;
 use self::connection::{
-    connection_arguments, connection_output, parse_connection_arguments, ConnectionObject,
+    connection_arguments, connection_output, parse_connection_arguments, total_count_needed,
+    ConnectionObject,
 };
 use self::inputs::keys_input::parse_keys_argument;
 use self::inputs::order_input::parse_order_argument;
@@ -351,7 +352,11 @@ pub fn resolve_many(
                 let connection = parse_connection_arguments(&ctx)?;
                 let keys = parse_keys_argument(&ctx)?;
                 let order = parse_order_argument(&ctx);
-                let total_count = count_rows(&mut conn, &table_name, &keys, &None).await?;
+                let total_count = if total_count_needed(&ctx, false) {
+                    count_rows(&mut conn, &table_name, &keys, &None).await?
+                } else {
+                    0
+                };
 
                 let (data, page_info) = fetch_multiple_rows(
                     &mut conn,

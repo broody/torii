@@ -26,7 +26,8 @@ use crate::constants::{DEFAULT_LIMIT, ID_COLUMN, TOKEN_BALANCE_NAME, TOKEN_BALAN
 use crate::mapping::TOKEN_BALANCE_TYPE_MAPPING;
 use crate::object::connection::page_info::PageInfoObject;
 use crate::object::connection::{
-    connection_arguments, cursor, parse_connection_arguments, ConnectionArguments,
+    connection_arguments, cursor, parse_connection_arguments, total_count_needed,
+    ConnectionArguments,
 };
 use crate::object::{BasicObject, ResolvableObject};
 use crate::query::order::{CursorDirection, Direction};
@@ -70,7 +71,12 @@ impl ResolvableObject for ErcBalanceObject {
                         &account_address.to_case(Case::Camel),
                     )?;
 
-                    let total_count = count_token_balances(&mut conn, address).await?;
+                    // offset pagination derives `hasNextPage` from the count
+                    let total_count = if total_count_needed(&ctx, !connection.is_cursor_based()) {
+                        count_token_balances(&mut conn, address).await?
+                    } else {
+                        0
+                    };
 
                     let (data, page_info) =
                         fetch_token_balances(&mut conn, address, &connection, total_count).await?;

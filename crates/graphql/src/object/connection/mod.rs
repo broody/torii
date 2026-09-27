@@ -72,6 +72,23 @@ impl BasicObject for ConnectionObject {
     }
 }
 
+impl ConnectionArguments {
+    /// Whether the page is selected by cursor (`first`/`last`/`after`/`before`) rather than by
+    /// `offset`/`limit`.
+    pub fn is_cursor_based(&self) -> bool {
+        self.first.or(self.last).is_some() || self.after.is_some() || self.before.is_some()
+    }
+}
+
+/// Whether the connection being resolved needs its total row count: when it selects `totalCount`,
+/// or `pageInfo` if `page_info_uses_count` (e.g. offset pagination deriving `hasNextPage` from
+/// it). `COUNT(*)` visits every matching row, so it is skipped when nothing reads it.
+pub fn total_count_needed(ctx: &ResolverContext<'_>, page_info_uses_count: bool) -> bool {
+    let selection = ctx.look_ahead();
+    selection.field("totalCount").exists()
+        || (page_info_uses_count && selection.field("pageInfo").exists())
+}
+
 pub fn parse_connection_arguments(ctx: &ResolverContext<'_>) -> Result<ConnectionArguments, Error> {
     connection_arguments_from_map(ctx.args.as_index_map())
 }
@@ -193,7 +210,90 @@ pub fn connection_output(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use async_graphql::dynamic::{FieldFuture, Object, Schema};
+
     use super::*;
+
+    /// Runs `query` against a schema whose `items` connection records what
+    /// [`total_count_needed`] returns, with and without `page_info_uses_count`.
+    async fn count_needed(query: &str) -> (bool, bool) {
+        let recorded = Arc::new(Mutex::new(None));
+        let items = {
+            let recorded = recorded.clone();
+            Field::new("items", TypeRef::named_nn("ItemConnection"), move |ctx| {
+                *recorded.lock().unwrap() = Some((
+                    total_count_needed(&ctx, false),
+                    total_count_needed(&ctx, true),
+                ));
+                FieldFuture::new(async move {
+                    Ok(Some(Value::from_json(serde_json::json!({
+                        "totalCount": 0,
+                        "pageInfo": { "hasNextPage": false },
+                        "edges": [],
+                    }))?))
+                })
+            })
+        };
+        let connection = Object::new("ItemConnection")
+            .field(value_field("totalCount", TypeRef::named_nn(TypeRef::INT)))
+            .field(value_field("pageInfo", TypeRef::named_nn("PageInfo")))
+            .field(value_field(
+                "edges",
+                TypeRef::named_nn_list_nn(TypeRef::INT),
+            ));
+        let page_info = Object::new("PageInfo").field(value_field(
+            "hasNextPage",
+            TypeRef::named_nn(TypeRef::BOOLEAN),
+        ));
+        let schema = Schema::build("Query", None, None)
+            .register(Object::new("Query").field(items))
+            .register(connection)
+            .register(page_info)
+            .finish()
+            .unwrap();
+
+        let response = schema.execute(query).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let recorded = recorded.lock().unwrap().take();
+        recorded.expect("items was not resolved")
+    }
+
+    fn value_field(name: &'static str, ty: TypeRef) -> Field {
+        Field::new(name, ty, move |ctx| {
+            FieldFuture::new(async move {
+                match ctx.parent_value.try_to_value()? {
+                    Value::Object(object) => Ok(object.get(name).cloned()),
+                    _ => Err("expected an object".into()),
+                }
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn total_count_is_only_needed_when_read() {
+        assert_eq!(count_needed("{ items { edges } }").await, (false, false));
+        assert_eq!(
+            count_needed("{ items { pageInfo { hasNextPage } } }").await,
+            (false, true)
+        );
+        assert_eq!(count_needed("{ items { totalCount } }").await, (true, true));
+        // aliases and fragments are seen through
+        assert_eq!(
+            count_needed("{ items { count: totalCount } }").await,
+            (true, true)
+        );
+        assert_eq!(
+            count_needed("{ items { ... on ItemConnection { totalCount } } }").await,
+            (true, true)
+        );
+        assert_eq!(
+            count_needed("{ items { ...Count } } fragment Count on ItemConnection { totalCount }")
+                .await,
+            (true, true)
+        );
+    }
 
     fn arguments(values: &[(&str, Value)]) -> Result<ConnectionArguments, Error> {
         let args = values

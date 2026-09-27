@@ -25,7 +25,8 @@ use crate::mapping::{
 };
 use crate::object::connection::page_info::PageInfoObject;
 use crate::object::connection::{
-    connection_arguments, cursor, parse_connection_arguments, ConnectionArguments,
+    connection_arguments, cursor, parse_connection_arguments, total_count_needed,
+    ConnectionArguments,
 };
 use crate::object::erc::{Connection, ConnectionEdge};
 use crate::object::{BasicObject, ResolvableObject};
@@ -424,8 +425,13 @@ impl ResolvableObject for TokenObject {
                                 _ => None,
                             };
 
+                            // offset pagination derives `hasNextPage` from the count
                             let total_count =
-                                count_tokens(&mut conn, contract_address.clone()).await?;
+                                if total_count_needed(&ctx, !connection.is_cursor_based()) {
+                                    count_tokens(&mut conn, contract_address.clone()).await?
+                                } else {
+                                    0
+                                };
 
                             let (data, page_info) =
                                 fetch_tokens(&mut conn, contract_address, &connection, total_count)

@@ -8,7 +8,9 @@ use torii_sqlite::constants::WORLD_CONTRACT_TYPE;
 use tracing::debug;
 
 use super::connection::page_info::PageInfoObject;
-use super::connection::{connection_arguments, cursor, parse_connection_arguments};
+use super::connection::{
+    connection_arguments, cursor, parse_connection_arguments, total_count_needed,
+};
 use super::{BasicObject, ResolvableObject};
 use crate::constants::{
     ID_COLUMN, JSON_COLUMN, METADATA_NAMES, METADATA_TABLE, METADATA_TYPE_NAME,
@@ -59,7 +61,11 @@ impl ResolvableObject for MetadataObject {
                 FieldFuture::new(async move {
                     let mut conn = ctx.data::<Pool<Sqlite>>()?.acquire().await?;
                     let connection = parse_connection_arguments(&ctx)?;
-                    let total_count = count_rows(&mut conn, METADATA_TABLE, &None, &None).await?;
+                    let total_count = if total_count_needed(&ctx, false) {
+                        count_rows(&mut conn, METADATA_TABLE, &None, &None).await?
+                    } else {
+                        0
+                    };
                     let (data, page_info) = fetch_multiple_rows(
                         &mut conn,
                         METADATA_TABLE,
