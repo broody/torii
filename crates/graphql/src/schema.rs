@@ -1,5 +1,6 @@
 use anyhow::Result;
 use async_graphql::dynamic::{Object, Scalar, Schema, Subscription, Union};
+use dojo_types::naming::get_tag;
 use dojo_types::schema::Ty;
 use sqlx::SqlitePool;
 use starknet::providers::Provider;
@@ -221,6 +222,7 @@ async fn build_objects(pool: &SqlitePool) -> Result<(Vec<ObjectVariant>, Vec<Uni
             objects.push(ObjectVariant::Resolvable(Box::new(ModelDataObject::new(
                 field_name,
                 type_name,
+                get_tag(&model.namespace, &model.name),
                 type_mapping.clone(),
                 schema,
             ))));

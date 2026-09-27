@@ -1,6 +1,5 @@
 use async_graphql::dynamic::{Enum, Field, FieldFuture, InputObject, Object, TypeRef};
 use async_graphql::Value;
-use dojo_types::naming::get_tag;
 use dojo_types::schema::Ty;
 use sqlx::{Pool, Sqlite};
 
@@ -24,6 +23,9 @@ pub struct ModelDataObject {
     pub name: String,
     pub plural_name: String,
     pub type_name: String,
+    /// Model tag (`{namespace}-{name}`), which is also the name of the model table. It can't be
+    /// derived back from the type name (`{namespace}_{name}`) as both parts may contain '_'.
+    pub table_name: String,
     pub type_mapping: TypeMapping,
     pub schema: Ty,
     pub where_input: WhereInputObject,
@@ -31,7 +33,13 @@ pub struct ModelDataObject {
 }
 
 impl ModelDataObject {
-    pub fn new(name: String, type_name: String, type_mapping: TypeMapping, schema: Ty) -> Self {
+    pub fn new(
+        name: String,
+        type_name: String,
+        table_name: String,
+        type_mapping: TypeMapping,
+        schema: Ty,
+    ) -> Self {
         let where_input = WhereInputObject::new(type_name.as_str(), &type_mapping);
         let order_input = OrderInputObject::new(type_name.as_str(), &type_mapping);
         let plural_name = format!("{}Models", name);
@@ -39,6 +47,7 @@ impl ModelDataObject {
             name,
             plural_name,
             type_name,
+            table_name,
             type_mapping,
             schema,
             where_input,
@@ -61,13 +70,9 @@ impl BasicObject for ModelDataObject {
     }
 
     fn objects(&self) -> Vec<Object> {
-        let mut parts = self.type_name().split('_').collect::<Vec<&str>>();
-        let model = parts.pop().unwrap();
-        let namespace = parts.join("_");
-        let type_name = get_tag(&namespace, model);
         let mut objects = data_objects_recursion(
             &TypeData::Nested((TypeRef::named(self.type_name()), self.type_mapping.clone())),
-            &vec![type_name],
+            &vec![self.table_name.clone()],
         );
 
         // root object requires entity_field association
@@ -93,7 +98,7 @@ impl ResolvableObject for ModelDataObject {
     }
 
     fn resolvers(&self) -> Vec<Field> {
-        let type_name = self.type_name.clone();
+        let table_name = self.table_name.clone();
         let type_mapping = self.type_mapping.clone();
         let where_mapping = self.where_input.type_mapping.clone();
         let field_type = format!("{}Connection", self.type_name());
@@ -101,10 +106,7 @@ impl ResolvableObject for ModelDataObject {
         let mut field = Field::new(self.name().1, TypeRef::named(field_type), move |ctx| {
             let type_mapping = type_mapping.clone();
             let where_mapping = where_mapping.clone();
-            let mut parts = type_name.split('_').collect::<Vec<&str>>();
-            let model = parts.pop().unwrap();
-            let namespace = parts.join("_");
-            let table_name = get_tag(&namespace, model);
+            let table_name = table_name.clone();
 
             FieldFuture::new(async move {
                 let mut conn = ctx.data::<Pool<Sqlite>>()?.acquire().await?;
