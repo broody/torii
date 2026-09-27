@@ -28,7 +28,8 @@ mod tests {
     use crate::tests::run_graphql_query;
 
     const ITEMS: u32 = 25;
-    const NODE_FIELDS: &str = "item_id amount score order typeCamel name big nested { inner }";
+    const NODE_FIELDS: &str =
+        "item_id amount score order typeCamel name big nested { inner } pair { _0 _1 }";
 
     fn member(name: &str, key: bool, ty: Ty) -> Member {
         Member {
@@ -40,7 +41,7 @@ mod tests {
 
     /// Registers the `qtest-Item` model and inserts `ITEMS` rows where, for item `i`:
     /// `amount = i`, `score = i % 4`, `order = i`, `typeCamel = ITEMS - i`, `name = "item-{i}"`,
-    /// `big = i` (u64, stored as hex text) and `nested.inner = i`.
+    /// `big = i` (u64, stored as hex text), `nested.inner = i` and `pair = (i % 5, i)`.
     async fn setup(pool: &SqlitePool) -> Schema {
         let (shutdown_tx, _) = broadcast::channel(1);
         let url: Url = "https://www.example.com".parse().unwrap();
@@ -84,6 +85,14 @@ mod tests {
                         children: vec![member("inner", false, Ty::Primitive(Primitive::U8(None)))],
                     }),
                 ),
+                member(
+                    "pair",
+                    false,
+                    Ty::Tuple(vec![
+                        Ty::Primitive(Primitive::U8(None)),
+                        Ty::Primitive(Primitive::U8(None)),
+                    ]),
+                ),
             ],
         });
 
@@ -108,8 +117,8 @@ mod tests {
         for i in 0..ITEMS {
             sqlx::query(
                 "INSERT INTO [qtest-Item] (internal_id, internal_event_id, internal_executed_at, \
-                 item_id, amount, score, [order], typeCamel, name, big, [nested.inner]) VALUES \
-                 (?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 item_id, amount, score, [order], typeCamel, name, big, [nested.inner], [pair.0], \
+                 [pair.1]) VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(format!("0x{i:x}"))
             .bind(format!("0x{i:04x}:0x0:0x0"))
@@ -120,6 +129,8 @@ mod tests {
             .bind(ITEMS - i)
             .bind(format!("item-{i}"))
             .bind(Primitive::U64(Some(i.into())).to_sql_value())
+            .bind(i)
+            .bind(i % 5)
             .bind(i)
             .execute(pool)
             .await
@@ -273,6 +284,32 @@ mod tests {
         // values are bound, never spliced into the SQL
         let connection = items_query(&schema, r#"(where: {name: "x' OR '1'='1"})"#).await;
         assert_eq!(count(connection), 0);
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn nested_comparators_and_tuple_members_filter(pool: SqlitePool) {
+        let schema = setup(&pool).await;
+
+        // comparators inside nested inputs used to be silently ignored, returning every row
+        let connection = items_query(&schema, "(where: {nested: {innerGT: 20}})").await;
+        assert_eq!(connection["totalCount"], 4);
+        let mut ids = item_ids(&connection);
+        ids.sort();
+        assert_eq!(ids, vec![21, 22, 23, 24]);
+
+        // tuple elements are exposed as `_0`, `_1` but stored in columns `0`, `1`
+        let connection = items_query(&schema, "(where: {pair: {_0: 3}}, first: 10)").await;
+        let mut ids = item_ids(&connection);
+        ids.sort();
+        assert_eq!(ids, vec![3, 8, 13, 18, 23]);
+        for edge in connection["edges"].as_array().unwrap() {
+            assert_eq!(edge["node"]["pair"]["_0"], 3);
+        }
+
+        let connection = items_query(&schema, "(where: {pair: {_1LT: 2, _0IN: [0, 1]}})").await;
+        let mut ids = item_ids(&connection);
+        ids.sort();
+        assert_eq!(ids, vec![0, 1]);
     }
 
     #[sqlx::test(migrations = "../migrations")]

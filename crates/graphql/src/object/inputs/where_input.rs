@@ -124,12 +124,14 @@ impl WhereInputObject {
                             nested_types,
                         );
 
-                        // Add field for the nested input using TypeData::Nested
+                        // Add field for the nested input using TypeData::Nested. The mapping is
+                        // the nested input's own where mapping so that its comparator fields
+                        // (e.g. `xGT`) are parsed, not only exact matches.
                         where_mapping.insert(
                             Name::new(field_name),
                             TypeData::Nested((
                                 TypeRef::named(&nested_input.type_name),
-                                nested_types.clone(),
+                                nested_input.type_mapping.clone(),
                             )),
                         );
                         nested_inputs.push(nested_input);
@@ -269,8 +271,33 @@ pub fn parse_where_argument(
                     .map(|input| parse_where_value(input, field_name, type_data))
             })
             .collect::<Result<Vec<_>>>()
-            .map(|filters| Some(filters.into_iter().flatten().collect()))
+            .map(|filters| {
+                Some(
+                    filters
+                        .into_iter()
+                        .flatten()
+                        .map(|mut filter| {
+                            filter.field = column_path(&filter.field);
+                            filter
+                        })
+                        .collect(),
+                )
+            })
     })
+}
+
+/// Maps a filter's field path to its column name. Tuple elements are exposed as `_0`, `_1`, ...
+/// but stored in columns named `0`, `1`, ... (e.g. `position._0` -> `position.0`).
+fn column_path(field_path: &str) -> String {
+    field_path
+        .split('.')
+        .enumerate()
+        .map(|(i, part)| match part.strip_prefix('_') {
+            Some(index) if i > 0 && index.parse::<usize>().is_ok() => index,
+            _ => part,
+        })
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 /// Parses a filter value of the member type `type_name` given to the where-input field
@@ -413,6 +440,16 @@ mod tests {
         let result = format_value_with_primitive_formatting("255", primitive);
         assert!(result.is_ok(), "U64 decimal formatting should work");
         assert_eq!(result.unwrap(), "0x00000000000000ff");
+    }
+
+    #[test]
+    fn test_column_path_maps_tuple_elements() {
+        assert_eq!(column_path("position._0"), "position.0");
+        assert_eq!(column_path("a._1.b._12"), "a.1.b.12");
+        // top-level members and non-numeric names are left untouched
+        assert_eq!(column_path("_0"), "_0");
+        assert_eq!(column_path("position._x"), "position._x");
+        assert_eq!(column_path("position.x"), "position.x");
     }
 
     #[test]
