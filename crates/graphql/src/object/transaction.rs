@@ -1,16 +1,18 @@
 use std::str::FromStr;
 
 use async_graphql::dynamic::{
-    Field, FieldFuture, FieldValue, InputValue, SubscriptionField, SubscriptionFieldFuture, TypeRef,
+    Field, FieldFuture, FieldValue, InputValue, ResolverContext, SubscriptionField,
+    SubscriptionFieldFuture, TypeRef,
 };
 use async_graphql::{Name, Value};
+use chrono::{DateTime, Utc};
 use sqlx::{FromRow, Pool, Sqlite};
 use starknet_crypto::Felt;
 use tokio_stream::StreamExt;
-use torii_broker::types::TransactionUpdate;
+use torii_broker::types::{InnerType, TransactionUpdate};
 use torii_broker::MemoryBroker;
-use torii_sqlite::types::Transaction;
 use torii_sqlite::utils::felt_to_sql_string;
+use tracing::warn;
 
 use super::{BasicObject, ResolvableObject, TypeMapping, ValueMapping};
 use crate::constants::{
@@ -92,15 +94,12 @@ impl ResolvableObject for TransactionObject {
             TypeRef::named_nn(self.type_name()),
             |ctx| {
                 SubscriptionFieldFuture::new(async move {
-                    let hash = match ctx.args.get("hash") {
-                        Some(hash) => Some(hash.string()?.to_string()),
-                        None => None,
-                    };
-
-                    let caller = match ctx.args.get("hasCaller") {
-                        Some(caller) => Some(caller.string()?.to_string()),
-                        None => None,
-                    };
+                    // Parsed once per subscription, and compared as felts so that any spelling
+                    // of a hash or address (unpadded, upper case) matches.
+                    let hash = felt_argument(&ctx, "hash")?;
+                    let caller = felt_argument(&ctx, "hasCaller")?;
+                    // `createdAt` is the only field the published transaction doesn't carry.
+                    let fetch_created_at = ctx.look_ahead().field("createdAt").exists();
 
                     let pool = ctx.data::<Pool<Sqlite>>()?.clone();
                     // if hash is None, then subscribe to all transactions
@@ -108,40 +107,47 @@ impl ResolvableObject for TransactionObject {
                     Ok(MemoryBroker::<TransactionUpdate>::subscribe()
                         .then(move |transaction| {
                             let pool = pool.clone();
-                            let hash = hash.clone();
-                            let caller = caller.clone();
                             async move {
-                                let transaction_hash =
-                                    felt_to_sql_string(&transaction.transaction_hash);
-                                if (hash.is_none() || hash == Some(transaction_hash.clone()))
-                                    && (caller.is_none()
-                                        || transaction.calls.iter().any(|call| {
-                                            call.caller_address
-                                                == Felt::from_str(&caller.clone().unwrap()).unwrap()
-                                        }))
+                                if hash.is_some_and(|hash| hash != transaction.transaction_hash)
+                                    || caller.is_some_and(|caller| {
+                                        !transaction
+                                            .calls
+                                            .iter()
+                                            .any(|call| call.caller_address == caller)
+                                    })
                                 {
-                                    let mut conn = match pool.acquire().await {
-                                        Ok(conn) => conn,
-                                        Err(_) => return None,
-                                    };
+                                    return None;
+                                }
 
-                                    let transaction = match sqlx::query_as::<_, Transaction>(
-                                        "SELECT * FROM transactions WHERE transaction_hash = ?",
+                                let created_at = if fetch_created_at {
+                                    match sqlx::query_scalar::<_, DateTime<Utc>>(
+                                        "SELECT created_at FROM transactions WHERE id = ?",
                                     )
-                                    .bind(&transaction_hash)
-                                    .fetch_one(&mut *conn)
+                                    .bind(felt_to_sql_string(&transaction.transaction_hash))
+                                    .fetch_one(&pool)
                                     .await
                                     {
-                                        Ok(transaction) => transaction,
-                                        Err(_) => return None,
-                                    };
-
-                                    Some(Ok(Value::Object(TransactionObject::value_mapping(
-                                        transaction,
-                                    ))))
+                                        Ok(created_at) => Some(created_at),
+                                        Err(error) => {
+                                            warn!(
+                                                %error,
+                                                transaction_hash = %format!(
+                                                    "{:#x}",
+                                                    transaction.transaction_hash
+                                                ),
+                                                "Failed to fetch transaction creation time."
+                                            );
+                                            return None;
+                                        }
+                                    }
                                 } else {
                                     None
-                                }
+                                };
+
+                                Some(Ok(Value::Object(TransactionObject::value_mapping(
+                                    &transaction,
+                                    created_at,
+                                ))))
                             }
                         })
                         .filter_map(|result| result))
@@ -156,36 +162,65 @@ impl ResolvableObject for TransactionObject {
     }
 }
 
+/// Parses an optional felt argument, treating null as absent.
+fn felt_argument(ctx: &ResolverContext<'_>, name: &str) -> async_graphql::Result<Option<Felt>> {
+    match ctx.args.get(name) {
+        Some(value) if !value.is_null() => {
+            let value = value.string()?;
+            Felt::from_str(value)
+                .map(Some)
+                .map_err(|_| async_graphql::Error::new(format!("Invalid {name}: {value}")))
+        }
+        _ => Ok(None),
+    }
+}
+
 impl TransactionObject {
-    pub fn value_mapping(transaction: Transaction) -> ValueMapping {
+    /// Maps a transaction published on the broker. It holds the same data as its row in the
+    /// `transactions` table, except for `created_at`.
+    pub fn value_mapping(
+        transaction: &<TransactionUpdate as InnerType>::Inner,
+        created_at: Option<DateTime<Utc>>,
+    ) -> ValueMapping {
+        let transaction_hash = felt_to_sql_string(&transaction.transaction_hash);
+        let felts = |felts: &[Felt]| felts.iter().map(felt_to_sql_string).collect::<Vec<_>>();
+
         async_graphql::dynamic::indexmap::IndexMap::from([
-            (Name::new("id"), Value::from(transaction.id)),
-            (
-                Name::new("transactionHash"),
-                Value::from(transaction.transaction_hash),
-            ),
+            (Name::new("id"), Value::from(transaction_hash.clone())),
+            (Name::new("transactionHash"), Value::from(transaction_hash)),
             (
                 Name::new("senderAddress"),
-                Value::from(transaction.sender_address),
+                Value::from(felt_to_sql_string(&transaction.sender_address)),
             ),
             (
                 Name::new("calldata"),
-                Value::from(transaction.calldata.split("/").collect::<Vec<_>>()),
+                Value::from(felts(&transaction.calldata)),
             ),
-            (Name::new("maxFee"), Value::from(transaction.max_fee)),
-            (Name::new("signature"), Value::from(transaction.signature)),
-            (Name::new("nonce"), Value::from(transaction.nonce)),
+            (
+                Name::new("maxFee"),
+                Value::from(felt_to_sql_string(&transaction.max_fee)),
+            ),
+            (
+                Name::new("signature"),
+                Value::from(felts(&transaction.signature)),
+            ),
+            (
+                Name::new("nonce"),
+                Value::from(felt_to_sql_string(&transaction.nonce)),
+            ),
             (
                 Name::new("executedAt"),
-                Value::from(transaction.executed_at.to_rfc3339()),
+                Value::from(transaction.block_timestamp.to_rfc3339()),
             ),
             (
                 Name::new("createdAt"),
-                Value::from(transaction.created_at.to_rfc3339()),
+                created_at.map_or(Value::Null, |created_at| {
+                    Value::from(created_at.to_rfc3339())
+                }),
             ),
             (
                 Name::new("transactionType"),
-                Value::from(transaction.transaction_type),
+                Value::from(transaction.transaction_type.clone()),
             ),
             (
                 Name::new("blockNumber"),

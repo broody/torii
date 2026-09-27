@@ -48,6 +48,7 @@ mod models_test;
 mod publish_message_test;
 mod query_layer_test;
 mod subscription_test;
+mod transaction_test;
 
 use crate::schema::build_schema;
 

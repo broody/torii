@@ -1,5 +1,5 @@
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -29,7 +29,7 @@ mod tests {
     const ACCOUNT: Felt = Felt::from_hex_unchecked("0xacc");
     const OTHER: Felt = Felt::from_hex_unchecked("0xbeef");
 
-    const TOKEN_FIELDS: &str = r#"
+    pub(crate) const TOKEN_FIELDS: &str = r#"
         tokenMetadata {
           __typename
           ... on ERC20__Token { contractAddress amount }
@@ -43,7 +43,7 @@ mod tests {
 
     /// Builds the schema over `pool`. Fixtures are inserted with plain SQL, so the executor is only
     /// needed while building the schema and shuts down when this returns.
-    async fn schema(pool: &SqlitePool) -> Schema {
+    pub(crate) async fn schema(pool: &SqlitePool) -> Schema {
         let (shutdown_tx, _) = broadcast::channel(1);
         let url: Url = "https://www.example.com".parse().unwrap();
         let provider = Arc::new(JsonRpcClient::new(HttpTransport::new(url)));
@@ -66,14 +66,14 @@ mod tests {
         schema
     }
 
-    fn token_key(contract: Felt, token_id: Option<u64>) -> String {
+    pub(crate) fn token_key(contract: Felt, token_id: Option<u64>) -> String {
         match token_id {
             Some(id) => felt_and_u256_to_sql_string(&contract, &U256::from(id)),
             None => felt_to_sql_string(&contract),
         }
     }
 
-    async fn insert_contract(pool: &SqlitePool, contract: Felt, contract_type: &str) {
+    pub(crate) async fn insert_contract(pool: &SqlitePool, contract: Felt, contract_type: &str) {
         sqlx::query("INSERT INTO contracts (id, contract_address, contract_type) VALUES (?, ?, ?)")
             .bind(felt_to_sql_string(&contract))
             .bind(felt_to_sql_string(&contract))
@@ -84,7 +84,7 @@ mod tests {
     }
 
     /// Inserts a `tokens` row: the contract-level row when `token_id` is `None`.
-    async fn insert_token(
+    pub(crate) async fn insert_token(
         pool: &SqlitePool,
         contract: Felt,
         token_id: Option<u64>,
@@ -129,7 +129,7 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn insert_transfer(
+    pub(crate) async fn insert_transfer(
         pool: &SqlitePool,
         block_number: u64,
         transaction_hash: Felt,
@@ -491,7 +491,11 @@ mod tests {
     }
 
     /// Runs `subscription`, publishes `updates` once it is subscribed and returns its first item.
-    async fn first_subscription_item<T, F>(schema: &Schema, subscription: &str, publish: F) -> Value
+    pub(crate) async fn first_subscription_item<T, F>(
+        schema: &Schema,
+        subscription: &str,
+        publish: F,
+    ) -> Value
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
