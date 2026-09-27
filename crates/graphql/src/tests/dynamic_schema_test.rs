@@ -26,7 +26,7 @@ mod tests {
     use url::Url;
 
     use crate::schema::build_schema;
-    use crate::server::{self, rebuild_schema_on_updates, DynamicSchema};
+    use crate::server::{self, rebuild_schema_on_updates, DynamicSchema, RebuildTiming};
     use crate::tests::model_fixtures;
     use crate::utils;
 
@@ -353,6 +353,21 @@ mod tests {
             pending_updates: usize,
             outcome: impl Fn(usize) -> Result<Schema> + Send + 'static,
         ) -> Self {
+            // Retries are left out of these tests, see `test_failed_rebuild_is_retried`.
+            let timing = RebuildTiming {
+                quiet_period,
+                max_delay,
+                retry_min: Duration::from_secs(3600),
+                retry_max: Duration::from_secs(3600),
+            };
+            Self::spawn_with_timing(timing, pending_updates, outcome)
+        }
+
+        fn spawn_with_timing(
+            timing: RebuildTiming,
+            pending_updates: usize,
+            outcome: impl Fn(usize) -> Result<Schema> + Send + 'static,
+        ) -> Self {
             let schema = DynamicSchema::new(versioned_schema(1, false));
             let (updates_tx, updates_rx) = mpsc::unbounded_channel();
             for _ in 0..pending_updates {
@@ -376,8 +391,7 @@ mod tests {
                 schema.clone(),
                 UnboundedReceiverStream::new(updates_rx),
                 shutdown_rx,
-                quiet_period,
-                max_delay,
+                timing,
                 build,
             ));
 
@@ -482,6 +496,33 @@ mod tests {
         wait_for_version(&harness.schema, 2).await;
 
         harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_failed_rebuild_is_retried() {
+        let timing = RebuildTiming {
+            quiet_period: Duration::from_millis(20),
+            max_delay: Duration::from_secs(5),
+            retry_min: Duration::from_millis(50),
+            retry_max: Duration::from_millis(100),
+        };
+        let mut harness = RebuildHarness::spawn_with_timing(timing, 1, |attempt| {
+            if attempt < 4 {
+                Err(anyhow::anyhow!("transient failure {attempt}"))
+            } else {
+                Ok(versioned_schema(2, false))
+            }
+        });
+
+        // A single update: the failed attempts are retried without further updates.
+        for expected in 1..=4 {
+            assert_eq!(harness.next_attempt().await, expected);
+        }
+        wait_for_version(&harness.schema, 2).await;
+
+        // Once a rebuild succeeds, retries stop.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(harness.attempts(), 4);
     }
 
     #[tokio::test]

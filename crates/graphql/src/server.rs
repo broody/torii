@@ -28,6 +28,34 @@ pub const SCHEMA_REBUILD_QUIET_PERIOD: Duration = Duration::from_millis(500);
 /// Upper bound on how long a continuous stream of model updates can postpone a schema rebuild.
 pub const SCHEMA_REBUILD_MAX_DELAY: Duration = Duration::from_secs(5);
 
+/// Delay before retrying a failed schema rebuild, doubled after each failure up to
+/// [`SCHEMA_REBUILD_RETRY_MAX`], so that a transient error (e.g. a pool timeout) doesn't leave the
+/// schema stale until the next model update.
+pub const SCHEMA_REBUILD_RETRY_MIN: Duration = Duration::from_secs(1);
+
+/// Upper bound on the delay between retries of a failed schema rebuild.
+pub const SCHEMA_REBUILD_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// Timing of the schema rebuild loop, see [`rebuild_schema_on_updates`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RebuildTiming {
+    pub(crate) quiet_period: Duration,
+    pub(crate) max_delay: Duration,
+    pub(crate) retry_min: Duration,
+    pub(crate) retry_max: Duration,
+}
+
+impl Default for RebuildTiming {
+    fn default() -> Self {
+        Self {
+            quiet_period: SCHEMA_REBUILD_QUIET_PERIOD,
+            max_delay: SCHEMA_REBUILD_MAX_DELAY,
+            retry_min: SCHEMA_REBUILD_RETRY_MIN,
+            retry_max: SCHEMA_REBUILD_RETRY_MAX,
+        }
+    }
+}
+
 /// Version of GraphiQL (and of its explorer plugin) served by the playground.
 const GRAPHIQL_VERSION: &str = "6.0.0-canary-d779fd3f.0";
 
@@ -57,8 +85,7 @@ pub async fn build<P: Provider + Sync + Send + Clone + 'static>(
         schema.clone(),
         model_updates,
         shutdown_rx,
-        SCHEMA_REBUILD_QUIET_PERIOD,
-        SCHEMA_REBUILD_MAX_DELAY,
+        RebuildTiming::default(),
         move || {
             let pool = pool.clone();
             let messaging = messaging.clone();
@@ -144,8 +171,7 @@ pub(crate) async fn rebuild_schema_on_updates<S, F, Fut>(
     schema: DynamicSchema,
     updates: S,
     mut shutdown_rx: Receiver<()>,
-    quiet_period: Duration,
-    max_delay: Duration,
+    timing: RebuildTiming,
     build: F,
 ) where
     S: Stream,
@@ -157,7 +183,7 @@ pub(crate) async fn rebuild_schema_on_updates<S, F, Fut>(
             debug!("Stopping GraphQL schema rebuild loop.");
             return;
         }
-        _ = rebuild_loop(schema, updates, quiet_period, max_delay, build) => {
+        _ = rebuild_loop(schema, updates, timing, build) => {
             warn!("Model update stream ended, GraphQL schema will no longer be rebuilt.");
         }
     }
@@ -169,8 +195,7 @@ pub(crate) async fn rebuild_schema_on_updates<S, F, Fut>(
 async fn rebuild_loop<S, F, Fut>(
     schema: DynamicSchema,
     updates: S,
-    quiet_period: Duration,
-    max_delay: Duration,
+    timing: RebuildTiming,
     mut build: F,
 ) where
     S: Stream,
@@ -178,10 +203,30 @@ async fn rebuild_loop<S, F, Fut>(
     Fut: Future<Output = Result<Schema>>,
 {
     let mut updates = std::pin::pin!(updates);
+    // Set after a failed rebuild: the delay before retrying it.
+    let mut retry_delay: Option<Duration> = None;
 
-    while updates.next().await.is_some() {
-        let mut updates_count = 1usize;
-        let deadline = Instant::now() + max_delay;
+    loop {
+        // Wait for a model update, or for the retry of a failed rebuild.
+        let update = match retry_delay {
+            Some(delay) => tokio::select! {
+                update = updates.next() => update.map(|_| true),
+                () = tokio::time::sleep(delay) => Some(false),
+            },
+            None => updates.next().await.map(|_| true),
+        };
+        let Some(is_update) = update else {
+            break;
+        };
+
+        let mut updates_count = usize::from(is_update);
+        // A retry rebuilds right away, an update waits for the stream to settle.
+        let deadline = Instant::now()
+            + if is_update {
+                timing.max_delay
+            } else {
+                Duration::ZERO
+            };
         let mut stream_open = true;
 
         // Debounce: keep draining updates until the stream has been quiet for `quiet_period`.
@@ -191,7 +236,8 @@ async fn rebuild_loop<S, F, Fut>(
                 break;
             }
 
-            match tokio::time::timeout_at((now + quiet_period).min(deadline), updates.next()).await
+            match tokio::time::timeout_at((now + timing.quiet_period).min(deadline), updates.next())
+                .await
             {
                 Ok(Some(_)) => updates_count += 1,
                 Ok(None) => {
@@ -206,6 +252,7 @@ async fn rebuild_loop<S, F, Fut>(
         match build().await {
             Ok(new_schema) => {
                 schema.swap(new_schema);
+                retry_delay = None;
                 info!(
                     updates = updates_count,
                     elapsed = ?started.elapsed(),
@@ -213,9 +260,14 @@ async fn rebuild_loop<S, F, Fut>(
                 );
             }
             Err(e) => {
+                let delay = retry_delay
+                    .map_or(timing.retry_min, |delay| delay * 2)
+                    .min(timing.retry_max);
+                retry_delay = Some(delay);
                 error!(
                     error = ?e,
                     updates = updates_count,
+                    retry_in = ?delay,
                     "Failed to rebuild GraphQL schema, keeping the previous schema."
                 );
             }
