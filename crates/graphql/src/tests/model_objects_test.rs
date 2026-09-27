@@ -26,7 +26,7 @@ mod tests {
     use url::Url;
 
     use crate::constants::INTERNAL_ENTITY_ID_KEY;
-    use crate::object::model_data::object;
+    use crate::object::model_data::{object, EntityRowId, EventMessageRowId, ModelNodeLoader};
     use crate::query::build_type_mapping;
     use crate::schema::build_schema;
     use crate::tests::run_graphql_query;
@@ -476,5 +476,116 @@ mod tests {
                 }
             })
         );
+    }
+
+    // The `entity` and `eventMessage` fields of model nodes are batched through a data loader,
+    // which must resolve the same values (and errors) as querying them node by node.
+    #[sqlx::test(migrations = "../migrations")]
+    #[serial]
+    async fn test_model_nodes_entity_and_event_message(pool: SqlitePool) {
+        let (db, _shutdown_tx) = setup_db(&pool).await;
+        register_model(&db, &player_stats(Felt::ZERO, None)).await;
+        let players = [Felt::ONE, Felt::TWO, Felt::THREE];
+        for (i, player) in players.iter().enumerate() {
+            let model = player_stats(*player, Some(i as u32));
+            set_entity(&db, &model, &format!("0x{i:x}:0x0:0x0")).await;
+            set_event_message(&db, &model, &format!("0x{i:x}:0x1:0x0")).await;
+        }
+        db.execute().await.unwrap();
+
+        let schema = schema(&db).await;
+        let result = run_graphql_query(
+            &schema,
+            r#"{
+                nsPlayerStatsModels {
+                    totalCount
+                    edges { node { player entity { id keys } eventMessage { id keys } } }
+                }
+            }"#,
+        )
+        .await;
+
+        // each player has an entity row and an event message row, both linked to the entity and
+        // the event message of the player
+        let connection = &result["nsPlayerStatsModels"];
+        assert_eq!(connection["totalCount"], 6);
+        let mut nodes: Vec<_> = connection["edges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|edge| edge["node"].clone())
+            .collect();
+        nodes.sort_by_key(|node| node["player"].as_str().unwrap().to_string());
+        let expected: Vec<_> = players
+            .iter()
+            .flat_map(|player| {
+                let hashed_keys = poseidon_hash_many(&[*player]);
+                let entity = json!({
+                    "id": format_world_scoped_id(&Felt::ZERO, &hashed_keys),
+                    "keys": [felt_to_sql_string(player)],
+                });
+                let node = json!({
+                    "player": format!("{player:#x}"),
+                    "entity": entity,
+                    "eventMessage": entity,
+                });
+                [node.clone(), node]
+            })
+            .collect();
+        assert_eq!(nodes, expected);
+
+        // an entity that was never emitted as an event message: its node's `eventMessage` fails
+        // like a single row lookup would
+        set_entity(&db, &player_stats(Felt::from(4u8), Some(4)), "0x4:0x0:0x0").await;
+        db.execute().await.unwrap();
+
+        let result = schema
+            .execute("{ nsPlayerStatsModels { edges { node { eventMessage { id } } } } }")
+            .await;
+        let errors: Vec<_> = result.errors.iter().map(|e| e.message.clone()).collect();
+        assert_eq!(errors, [sqlx::Error::RowNotFound.to_string()]);
+    }
+
+    // The loader is schema data shared by all requests: it must batch lookups, never cache them.
+    #[sqlx::test(migrations = "../migrations")]
+    async fn test_model_node_loader_does_not_cache(pool: SqlitePool) {
+        for id in ["a", "b"] {
+            sqlx::query(
+                "INSERT INTO entities (id, keys, event_id, executed_at) VALUES (?, '0x1/', \
+                 'event', '2024-03-18T09:34:38Z')",
+            )
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let id = |id: &str| EntityRowId(id.to_string());
+        let loader = ModelNodeLoader::data_loader(pool.clone());
+
+        let loaded = loader
+            .load_many([id("a"), id("b"), id("missing")])
+            .await
+            .unwrap();
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[&id("a")]["id"], Value::from("a"));
+        assert_eq!(
+            loaded[&id("a")]["keys"],
+            Value::List(vec![Value::from("0x1")])
+        );
+        assert_eq!(loaded[&id("b")]["eventId"], Value::from("event"));
+
+        sqlx::query("UPDATE entities SET event_id = 'updated' WHERE id = 'a'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let a = loader.load_one(id("a")).await.unwrap().unwrap();
+        assert_eq!(a["eventId"], Value::from("updated"));
+
+        // event messages live in their own table
+        let event_message = loader
+            .load_one(EventMessageRowId("a".to_string()))
+            .await
+            .unwrap();
+        assert!(event_message.is_none());
     }
 }

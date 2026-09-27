@@ -13,7 +13,7 @@ use tracing::warn;
 use super::object::connection::page_info::PageInfoObject;
 use super::object::entity::EntityObject;
 use super::object::event::EventObject;
-use super::object::model_data::{ModelDataObject, ModelRegistry, RegisteredModel};
+use super::object::model_data::{ModelDataObject, ModelNodeLoader, ModelRegistry, RegisteredModel};
 use super::types::ScalarType;
 use super::utils;
 use crate::constants::{
@@ -149,6 +149,7 @@ pub async fn build_schema<P: Provider + Sync + Send + 'static>(
         .data(messaging as Arc<dyn MessagingTrait>)
         .data(storage)
         .data(Arc::new(model_registry))
+        .data(ModelNodeLoader::data_loader(pool.clone()))
         .finish()
         .map_err(|e| e.into())
 }

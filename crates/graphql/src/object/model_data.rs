@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_graphql::dataloader::{DataLoader, Loader, NoCache};
 use async_graphql::dynamic::{Enum, Field, FieldFuture, FieldValue, InputObject, Object, TypeRef};
 use async_graphql::Value;
 use dojo_types::schema::Ty;
-use sqlx::{Pool, Sqlite};
+use sqlx::{Pool, Row, Sqlite};
 use tracing::debug;
 
 use super::connection::{connection_arguments, connection_output, parse_connection_arguments};
@@ -17,7 +18,7 @@ use crate::constants::{
     EVENT_MESSAGE_TYPE_NAME, ID_COLUMN, INTERNAL_ENTITY_ID_KEY,
 };
 use crate::mapping::ENTITY_TYPE_MAPPING;
-use crate::query::data::{count_rows, fetch_multiple_rows, fetch_single_row};
+use crate::query::data::{count_rows, fetch_multiple_rows};
 use crate::query::value_mapping_from_row;
 use crate::types::TypeData;
 use crate::utils;
@@ -218,11 +219,12 @@ fn entity_field() -> Field {
         FieldFuture::new(async move {
             match ctx.parent_value.try_to_value()? {
                 Value::Object(indexmap) => {
-                    let mut conn = ctx.data::<Pool<Sqlite>>()?.acquire().await?;
                     let entity_id = utils::extract::<String>(indexmap, INTERNAL_ENTITY_ID_KEY)?;
-                    let data =
-                        fetch_single_row(&mut conn, ENTITY_TABLE, ID_COLUMN, &entity_id).await?;
-                    let entity = value_mapping_from_row(&data, &ENTITY_TYPE_MAPPING, false, true)?;
+                    let entity = ctx
+                        .data::<ModelNodeDataLoader>()?
+                        .load_one(EntityRowId(entity_id))
+                        .await?
+                        .ok_or(sqlx::Error::RowNotFound)?;
 
                     Ok(Some(Value::Object(entity)))
                 }
@@ -240,13 +242,12 @@ fn event_message_field() -> Field {
             FieldFuture::new(async move {
                 match ctx.parent_value.try_to_value()? {
                     Value::Object(indexmap) => {
-                        let mut conn = ctx.data::<Pool<Sqlite>>()?.acquire().await?;
                         let entity_id = utils::extract::<String>(indexmap, INTERNAL_ENTITY_ID_KEY)?;
-                        let data =
-                            fetch_single_row(&mut conn, EVENT_MESSAGE_TABLE, ID_COLUMN, &entity_id)
-                                .await?;
-                        let event_message =
-                            value_mapping_from_row(&data, &ENTITY_TYPE_MAPPING, false, true)?;
+                        let event_message = ctx
+                            .data::<ModelNodeDataLoader>()?
+                            .load_one(EventMessageRowId(entity_id))
+                            .await?
+                            .ok_or(sqlx::Error::RowNotFound)?;
 
                         Ok(Some(Value::Object(event_message)))
                     }
@@ -255,6 +256,99 @@ fn event_message_field() -> Field {
             })
         },
     )
+}
+
+/// Batches the `entity` and `eventMessage` lookups of model nodes into one query per table.
+///
+/// It is registered as schema data and thus shared by all requests, so it must not cache: rows
+/// would be served stale across requests.
+pub type ModelNodeDataLoader = DataLoader<ModelNodeLoader, NoCache>;
+
+/// Id of an `entities` row.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EntityRowId(pub String);
+
+/// Id of an `event_messages` row.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EventMessageRowId(pub String);
+
+/// Loads `entities` and `event_messages` rows by id, as mapped by [`ENTITY_TYPE_MAPPING`].
+#[derive(Debug)]
+pub struct ModelNodeLoader {
+    pool: Pool<Sqlite>,
+}
+
+impl ModelNodeLoader {
+    pub fn new(pool: Pool<Sqlite>) -> Self {
+        Self { pool }
+    }
+
+    pub fn data_loader(pool: Pool<Sqlite>) -> ModelNodeDataLoader {
+        DataLoader::new(Self::new(pool), tokio::spawn)
+    }
+
+    async fn load_rows<'a>(
+        &self,
+        table: &str,
+        ids: impl ExactSizeIterator<Item = &'a str>,
+    ) -> Result<HashMap<String, ValueMapping>, Arc<sqlx::Error>> {
+        if ids.len() == 0 {
+            return Ok(HashMap::new());
+        }
+
+        // the data loader batches at most 1000 keys, well below SQLite's variables limit
+        let placeholders = vec!["?"; ids.len()].join(", ");
+        let query = format!("SELECT * FROM [{table}] WHERE {ID_COLUMN} IN ({placeholders})");
+        let rows = ids
+            .fold(sqlx::query(&query), |query, id| query.bind(id))
+            .fetch_all(&self.pool)
+            .await?;
+
+        rows.iter()
+            .map(|row| {
+                let id = row.try_get::<String, _>(ID_COLUMN)?;
+                let values = value_mapping_from_row(row, &ENTITY_TYPE_MAPPING, false, true)?;
+                Ok((id, values))
+            })
+            .collect::<sqlx::Result<_>>()
+            .map_err(Arc::new)
+    }
+}
+
+impl Loader<EntityRowId> for ModelNodeLoader {
+    type Value = ValueMapping;
+    type Error = Arc<sqlx::Error>;
+
+    async fn load(
+        &self,
+        keys: &[EntityRowId],
+    ) -> Result<HashMap<EntityRowId, Self::Value>, Self::Error> {
+        let rows = self
+            .load_rows(ENTITY_TABLE, keys.iter().map(|key| key.0.as_str()))
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, values)| (EntityRowId(id), values))
+            .collect())
+    }
+}
+
+impl Loader<EventMessageRowId> for ModelNodeLoader {
+    type Value = ValueMapping;
+    type Error = Arc<sqlx::Error>;
+
+    async fn load(
+        &self,
+        keys: &[EventMessageRowId],
+    ) -> Result<HashMap<EventMessageRowId, Self::Value>, Self::Error> {
+        let rows = self
+            .load_rows(EVENT_MESSAGE_TABLE, keys.iter().map(|key| key.0.as_str()))
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, values)| (EventMessageRowId(id), values))
+            .collect())
+    }
 }
 
 /// A model exposed by the schema, as a member of `ModelUnion`.
