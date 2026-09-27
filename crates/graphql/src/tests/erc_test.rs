@@ -1,14 +1,19 @@
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use async_graphql::dynamic::Schema;
     use serde_json::Value;
+    use serial_test::serial;
     use sqlx::SqlitePool;
     use starknet::core::types::{Felt, U256};
     use starknet::providers::jsonrpc::HttpTransport;
     use starknet::providers::JsonRpcClient;
     use tokio::sync::broadcast;
+    use tokio_stream::StreamExt;
+    use torii_broker::types::{TokenBalanceUpdate, Update};
+    use torii_broker::MemoryBroker;
     use torii_messaging::{Messaging, MessagingConfig};
     use torii_sqlite::executor::Executor;
     use torii_sqlite::utils::{
@@ -483,6 +488,70 @@ mod tests {
         let token = get(&connection["edges"][1], &["node", "tokenMetadata"]);
         assert_eq!(token["tokenId"], u256_to_sql_string(&U256::from(2u8)));
         assert_eq!(token["metadataName"], Value::Null);
+    }
+
+    /// Runs `subscription`, publishes `updates` once it is subscribed and returns its first item.
+    async fn first_subscription_item<T, F>(schema: &Schema, subscription: &str, publish: F) -> Value
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let mut stream = schema.execute_stream(subscription);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            publish();
+        });
+        let response = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("no subscription item received")
+            .unwrap();
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        response.data.into_json().unwrap()
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[serial]
+    async fn test_token_balance_subscription(pool: SqlitePool) {
+        let schema = schema(&pool).await;
+        insert_tokens(&pool).await;
+        insert_balance(&pool, ACCOUNT, ERC721, None, 1).await;
+        insert_balance(&pool, ACCOUNT, ERC1155, Some(1), 3).await;
+
+        let balance = |token_id: Option<u64>, contract_address: Felt| -> TokenBalanceUpdate {
+            let balance = torii_storage::proto::TokenBalance {
+                balance: 3u64.into(),
+                account_address: ACCOUNT,
+                contract_address,
+                token_id: token_id.map(Into::into),
+            };
+            Update::new(balance, false)
+        };
+        let subscription = format!(
+            "subscription {{ tokenBalanceUpdated(accountAddress: \"{ACCOUNT:#x}\") {{ \
+             {TOKEN_FIELDS} }} }}"
+        );
+        let data = first_subscription_item(&schema, &subscription, move || {
+            // The contract-level balance of a collection is skipped.
+            MemoryBroker::publish(balance(None, ERC721));
+            MemoryBroker::publish(balance(Some(1), ERC1155));
+        })
+        .await;
+        let token = &data["tokenBalanceUpdated"]["tokenMetadata"];
+        assert_eq!(token["__typename"], "ERC1155__Token");
+        assert_eq!(token["amount"], u256_to_sql_string(&U256::from(3u8)));
+
+        // An invalid address is an error, not a panic.
+        let response = schema
+            .execute_stream(
+                "subscription { tokenBalanceUpdated(accountAddress: \"foo\") { __typename } }",
+            )
+            .next()
+            .await
+            .unwrap();
+        assert_eq!(response.errors.len(), 1);
+        assert!(response.errors[0]
+            .message
+            .contains("Invalid accountAddress"));
     }
 
     // Balance ids (`account/contract:token_id`) contain '/', which `cursor::decode` can't handle

@@ -94,8 +94,13 @@ impl ResolvableObject for ErcBalanceObject {
             |ctx| {
                 SubscriptionFieldFuture::new(async move {
                     let address = match ctx.args.get("accountAddress") {
-                        Some(addr) => Some(Felt::from_str(addr.string()?).unwrap()),
-                        None => None,
+                        Some(addr) if !addr.is_null() => {
+                            let addr = addr.string()?;
+                            Some(Felt::from_str(addr).map_err(|_| {
+                                async_graphql::Error::new(format!("Invalid accountAddress: {addr}"))
+                            })?)
+                        }
+                        _ => None,
                     };
 
                     let pool = ctx.data::<Pool<Sqlite>>()?;
@@ -110,7 +115,9 @@ impl ResolvableObject for ErcBalanceObject {
                                     }
                                 }
 
-                                // Fetch associated token data
+                                // The update only carries the balance: the token's name, symbol,
+                                // decimals, metadata and contract type still have to be read
+                                // from the database (primary key lookups).
                                 let query = format!(
                                     "SELECT b.id, t.contract_address, t.name, t.symbol, \
                                          t.decimals, b.balance, b.token_id, t.metadata, \
